@@ -6672,6 +6672,163 @@ def setup_mcp_server(hexstrike_client: HexStrikeClient) -> FastMCP:
 
         return result
 
+    # ─────────────────────────────────────────────────────────
+    #  JS SECRET MINER TOOL
+    # ─────────────────────────────────────────────────────────
+    @mcp.tool()
+    def js_secret_mine(
+        target: str,
+        depth: int = 3,
+        use_trufflehog: bool = True,
+        use_nuclei: bool = True,
+    ) -> Dict[str, Any]:
+        """
+        Crawl a target with katana to extract all JS file URLs, then scan
+        each JS file for hardcoded secrets using built-in regex patterns
+        plus optional trufflehog and nuclei exposure templates.
+
+        Detects: AWS keys, JWTs, Google API keys, Stripe live keys, GitHub
+        tokens, Slack tokens, SendGrid keys, private keys, hardcoded
+        passwords, Basic-auth in URLs, and internal endpoint leaks.
+
+        Args:
+            target:         Full URL of the target (e.g. https://example.com)
+            depth:          katana crawl depth (default 3)
+            use_trufflehog: Also run trufflehog if installed (default True)
+            use_nuclei:     Also run nuclei exposures templates (default True)
+
+        Returns:
+            Findings grouped by severity with match, context, and source JS URL.
+        """
+        resp = requests.post(
+            f"{BASE_URL}/api/tools/secrets/scan",
+            json={
+                "target":        target,
+                "depth":         depth,
+                "use_trufflehog": use_trufflehog,
+                "use_nuclei":    use_nuclei,
+            },
+            timeout=300,
+        )
+        result = resp.json()
+
+        lines = [
+            f"🔍 JS Secret Miner — {target}",
+            f"📄 JS files scanned : {result.get('js_files_scanned', 0)}",
+            f"🚨 CRITICAL         : {result.get('critical', 0)}",
+            f"🔴 HIGH             : {result.get('high', 0)}",
+            f"🟡 MEDIUM           : {result.get('medium', 0)}",
+            f"⏱  Duration         : {result.get('duration_sec', 0)}s",
+            "",
+        ]
+
+        sev_icons = {"CRITICAL": "🚨", "HIGH": "🔴", "MEDIUM": "🟡", "LOW": "🔵"}
+        for f in result.get("findings", []):
+            icon = sev_icons.get(f.get("severity", ""), "❓")
+            lines.append(f"{icon} [{f['severity']}] {f['type']}  (tool: {f.get('tool', 'builtin_regex')})")
+            lines.append(f"   Match   : {f.get('match', '')[:120]}")
+            lines.append(f"   Source  : {f.get('source', '')}")
+            if f.get("context"):
+                lines.append(f"   Context : {f.get('context', '')[:120]}")
+            lines.append("")
+
+        if not result.get("findings"):
+            lines.append("✅ No secrets found in JS files.")
+
+        logger.info(
+            f"{HexStrikeColors.SUCCESS}🔍 JS Secret Miner: {result.get('total_findings', 0)} findings "
+            f"({result.get('critical', 0)} CRITICAL) on {target}{HexStrikeColors.RESET}"
+        )
+        return {"output": "\n".join(lines), "data": result}
+
+    # ─────────────────────────────────────────────────────────
+    #  LOOT INTELLIGENCE TOOL
+    # ─────────────────────────────────────────────────────────
+    @mcp.tool()
+    def loot_analyze(
+        client_id: str,
+        beacon_url: str = "http://localhost:8444",
+        jstap_username: str = "",
+        jstap_password: str = "",
+    ) -> Dict[str, Any]:
+        """
+        Fetch all captured loot for a JS-Tap client session and run
+        automated intelligence analysis to surface credentials, auth tokens,
+        API keys, and secrets across every loot category.
+
+        Loot categories analyzed:
+          - Cookies       → flags auth/session cookies and scans values for secrets
+          - localStorage  → flags sensitive keys (token, auth, jwt, etc.)
+          - sessionStorage→ same as above
+          - XHR/Fetch     → scans request headers (Authorization, X-API-Key),
+                            request bodies, and response bodies
+          - Form posts     → flags password/credential field captures
+          - User inputs    → scans typed input for embedded secrets
+
+        Args:
+            client_id:      JS-Tap client ID (from beacon_list_clients)
+            beacon_url:     JS-Tap server URL (default http://localhost:8444)
+            jstap_username: JS-Tap portal username (if auth required)
+            jstap_password: JS-Tap portal password (if auth required)
+
+        Returns:
+            Structured findings with severity ratings and raw loot summary.
+        """
+        resp = requests.post(
+            f"{BASE_URL}/api/tools/loot/analyze",
+            json={
+                "client_id":  client_id,
+                "beacon_url": beacon_url,
+                "username":   jstap_username,
+                "password":   jstap_password,
+            },
+            timeout=60,
+        )
+        result = resp.json()
+
+        # Summary header
+        lines = [
+            f"🧠 Loot Intelligence — client: {client_id}",
+            "",
+            "📦 Loot captured:",
+        ]
+        for loot_type, count in result.get("loot_summary", {}).items():
+            lines.append(f"   {loot_type:<16}: {count}")
+
+        lines += [
+            "",
+            f"🚨 CRITICAL : {result.get('critical', 0)}",
+            f"🔴 HIGH     : {result.get('high', 0)}",
+            f"🟡 MEDIUM   : {result.get('medium', 0)}",
+            "",
+        ]
+
+        sev_icons = {"CRITICAL": "🚨", "HIGH": "🔴", "MEDIUM": "🟡", "LOW": "🔵"}
+        for f in result.get("findings", []):
+            icon = sev_icons.get(f.get("severity", ""), "❓")
+            lines.append(f"{icon} [{f.get('severity', '?')}] {f.get('type', '?')}")
+            # Print whichever identifier field is present
+            for key in ("field", "header", "key", "name", "match"):
+                if f.get(key):
+                    lines.append(f"   {key.capitalize():<8}: {f[key]}")
+                    break
+            val = f.get("value") or f.get("match", "")
+            if val:
+                lines.append(f"   Value   : {str(val)[:120]}")
+            if f.get("notes"):
+                lines.append(f"   Notes   : {f['notes']}")
+            lines.append(f"   Source  : {f.get('source', '')}")
+            lines.append("")
+
+        if not result.get("findings"):
+            lines.append("✅ No sensitive findings in captured loot.")
+
+        logger.info(
+            f"{HexStrikeColors.SUCCESS}🧠 Loot Intelligence: {result.get('total_findings', 0)} findings "
+            f"({result.get('critical', 0)} CRITICAL) for client {client_id}{HexStrikeColors.RESET}"
+        )
+        return {"output": "\n".join(lines), "data": result}
+
     return mcp
 
 def parse_args():

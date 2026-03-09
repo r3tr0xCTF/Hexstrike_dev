@@ -19830,6 +19830,435 @@ def pipeline_xss():
         return jsonify({"error": f"Server error: {e}"}), 500
 
 
+
+# ─────────────────────────────────────────────────────────
+#  JS SECRET MINER
+# ─────────────────────────────────────────────────────────
+class JSSecretMiner:
+    """
+    Crawl a target with katana, extract every JS file URL, then scan each
+    file for hardcoded secrets using built-in regex patterns plus optional
+    trufflehog and nuclei exposure templates.
+    """
+
+    # (label, pattern, severity)
+    SECRET_PATTERNS = [
+        ("AWS Access Key",      r"AKIA[0-9A-Z]{16}",                                              "CRITICAL"),
+        ("JWT Token",           r"eyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+",        "HIGH"),
+        ("Google API Key",      r"AIza[0-9A-Za-z\-_]{35}",                                        "HIGH"),
+        ("Stripe Live Secret",  r"sk_live_[0-9a-zA-Z]{24,}",                                      "CRITICAL"),
+        ("Stripe Live Public",  r"pk_live_[0-9a-zA-Z]{24,}",                                      "MEDIUM"),
+        ("GitHub Token",        r"ghp_[A-Za-z0-9]{36}",                                           "CRITICAL"),
+        ("GitHub PAT",          r"github_pat_[A-Za-z0-9_]{82}",                                   "CRITICAL"),
+        ("Slack Token",         r"xox[baprs]-[0-9A-Za-z\-]{10,48}",                               "HIGH"),
+        ("Twilio Auth Token",   r"SK[0-9a-fA-F]{32}",                                             "HIGH"),
+        ("SendGrid Key",        r"SG\.[A-Za-z0-9_\-]{22}\.[A-Za-z0-9_\-]{43}",                   "CRITICAL"),
+        ("Firebase Key",        r"AAAA[A-Za-z0-9_\-]{7}:[A-Za-z0-9_\-]{140}",                   "HIGH"),
+        ("Private Key Header",  r"-----BEGIN (?:RSA |EC |DSA |OPENSSH )?PRIVATE KEY",             "CRITICAL"),
+        ("Hardcoded Password",  r"(?:password|passwd|pwd|secret|api_key|apikey)\s*[:=]\s*['\"][^'\"]{8,}['\"]", "HIGH"),
+        ("Basic Auth in URL",   r"https?://[^/\s:@]{1,64}:[^/\s:@]{1,64}@[^/\s]+",              "HIGH"),
+        ("Internal Endpoint",   r"https?://(?:localhost|127\.0\.0\.1|192\.168\.|10\.|172\.(?:1[6-9]|2[0-9]|3[01])\.)\S+", "MEDIUM"),
+        ("Mailchimp Key",       r"[0-9a-f]{32}-us[0-9]{1,2}",                                    "HIGH"),
+        ("Generic Bearer",      r"(?:bearer|authorization)\s*[:=]\s*['\"]([A-Za-z0-9_\-\.]{20,})['\"]", "MEDIUM"),
+        ("Generic Token",       r"(?:token|api_token|access_token)\s*[:=]\s*['\"]([A-Za-z0-9_\-\.]{20,})['\"]", "MEDIUM"),
+    ]
+
+    def _crawl_js_urls(self, target: str, depth: int = 3) -> List[str]:
+        """Use katana to find JS file URLs on the target."""
+        cmd = [
+            "katana", "-u", target, "-d", str(depth), "-jc",
+            "-ef", "css,png,jpg,gif,ico,woff,woff2,ttf,eot,svg",
+            "-silent",
+        ]
+        try:
+            res = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+            urls = []
+            for line in res.stdout.splitlines():
+                line = line.strip()
+                if line.endswith(".js") or ".js?" in line or ".js#" in line:
+                    urls.append(line)
+            return list(set(urls))
+        except Exception as e:
+            logger.warning(f"katana crawl error: {e}")
+            return []
+
+    def _fetch_js(self, url: str, timeout: int = 10) -> str:
+        """Download a JS file; return empty string on failure."""
+        try:
+            r = requests.get(
+                url, timeout=timeout, verify=False,
+                headers={"User-Agent": "Mozilla/5.0 (compatible; HexStrike/1.0)"},
+            )
+            return r.text
+        except Exception:
+            return ""
+
+    def _scan_content(self, content: str, source_url: str) -> List[Dict]:
+        """Apply all SECRET_PATTERNS to content and return findings."""
+        findings = []
+        lines = content.splitlines()
+        for label, pattern, severity in self.SECRET_PATTERNS:
+            for m in re.finditer(pattern, content, re.IGNORECASE):
+                match_str = m.group(0)[:200]
+                # Grab the source line for context
+                start = content.rfind("\n", 0, m.start()) + 1
+                end   = content.find("\n", m.end())
+                ctx   = content[start: end if end != -1 else m.end() + 80].strip()[:200]
+                findings.append({
+                    "type":     label,
+                    "severity": severity,
+                    "match":    match_str,
+                    "context":  ctx,
+                    "source":   source_url,
+                    "tool":     "builtin_regex",
+                })
+        return findings
+
+    def _run_trufflehog(self, target: str) -> List[Dict]:
+        """Run trufflehog against the target URL (if installed)."""
+        findings = []
+        try:
+            res = subprocess.run(
+                ["trufflehog", "filesystem", "--json", target],
+                capture_output=True, text=True, timeout=120,
+            )
+            for line in res.stdout.splitlines():
+                try:
+                    data = json.loads(line)
+                    findings.append({
+                        "type":     data.get("DetectorName", "Unknown"),
+                        "severity": "HIGH",
+                        "match":    data.get("Raw", "")[:100],
+                        "context":  str(data.get("SourceMetadata", {}))[:200],
+                        "source":   target,
+                        "tool":     "trufflehog",
+                    })
+                except Exception:
+                    pass
+        except FileNotFoundError:
+            logger.debug("trufflehog not installed — skipping")
+        return findings
+
+    def _run_nuclei_exposures(self, target: str) -> List[Dict]:
+        """Run nuclei with exposure templates against the target."""
+        findings = []
+        try:
+            res = subprocess.run(
+                ["nuclei", "-u", target, "-t", "exposures/", "-json", "-silent"],
+                capture_output=True, text=True, timeout=180,
+            )
+            for line in res.stdout.splitlines():
+                try:
+                    data = json.loads(line)
+                    findings.append({
+                        "type":     data.get("info", {}).get("name", "Unknown"),
+                        "severity": data.get("info", {}).get("severity", "medium").upper(),
+                        "match":    data.get("matched-at", ""),
+                        "context":  str(data.get("extracted-results", [])),
+                        "source":   target,
+                        "tool":     "nuclei",
+                    })
+                except Exception:
+                    pass
+        except FileNotFoundError:
+            logger.debug("nuclei not installed — skipping")
+        return findings
+
+    def run(
+        self,
+        target: str,
+        depth: int = 3,
+        use_trufflehog: bool = True,
+        use_nuclei: bool = True,
+    ) -> Dict:
+        _start = time.time()
+        all_findings: List[Dict] = []
+
+        # 1. Crawl JS URLs with katana
+        js_urls = self._crawl_js_urls(target, depth)
+        logger.info(f"JSSecretMiner: {len(js_urls)} JS files found on {target}")
+
+        # 2. Scan each JS file with built-in regex
+        for url in js_urls:
+            content = self._fetch_js(url)
+            if content:
+                all_findings.extend(self._scan_content(content, url))
+
+        # 3. Optional: trufflehog
+        if use_trufflehog:
+            all_findings.extend(self._run_trufflehog(target))
+
+        # 4. Optional: nuclei exposures
+        if use_nuclei:
+            all_findings.extend(self._run_nuclei_exposures(target))
+
+        # Deduplicate by (type, match[:50])
+        seen: set = set()
+        unique: List[Dict] = []
+        for f in all_findings:
+            key = (f["type"], f["match"][:50])
+            if key not in seen:
+                seen.add(key)
+                unique.append(f)
+
+        sev_order = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3}
+        unique.sort(key=lambda x: sev_order.get(x["severity"], 99))
+
+        return {
+            "target":           target,
+            "js_files_scanned": len(js_urls),
+            "js_urls":          js_urls,
+            "total_findings":   len(unique),
+            "critical":         sum(1 for f in unique if f["severity"] == "CRITICAL"),
+            "high":             sum(1 for f in unique if f["severity"] == "HIGH"),
+            "medium":           sum(1 for f in unique if f["severity"] == "MEDIUM"),
+            "findings":         unique,
+            "duration_sec":     round(time.time() - _start, 2),
+        }
+
+
+js_secret_miner = JSSecretMiner()
+
+
+@app.route("/api/tools/secrets/scan", methods=["POST"])
+def js_secrets_scan():
+    try:
+        params = request.json or {}
+        result = js_secret_miner.run(
+            target=params.get("target", ""),
+            depth=int(params.get("depth", 3)),
+            use_trufflehog=bool(params.get("use_trufflehog", True)),
+            use_nuclei=bool(params.get("use_nuclei", True)),
+        )
+        return jsonify(result)
+    except Exception as e:
+        logger.error(f"💥 secrets/scan error: {e}")
+        return jsonify({"error": f"Server error: {e}"}), 500
+
+
+# ─────────────────────────────────────────────────────────
+#  LOOT INTELLIGENCE ENGINE
+# ─────────────────────────────────────────────────────────
+class LootIntelligence:
+    """
+    Pull all captured loot for a JS-Tap client session (cookies, storage,
+    XHR calls, form posts, user inputs) and run automated analysis to surface
+    credentials, auth tokens, API keys, and secrets.
+    """
+
+    # Reuse the same patterns as JSSecretMiner
+    SECRET_PATTERNS = JSSecretMiner.SECRET_PATTERNS
+
+    _AUTH_COOKIE_NAMES = {
+        "session", "auth", "token", "jwt", "access", "refresh",
+        "id", "user", "login", "sid", "sess", "bearer",
+    }
+    _CRED_FIELDS = {
+        "password", "passwd", "pass", "pwd", "secret",
+        "pin", "ssn", "cvv", "card", "credentials",
+    }
+
+    def _find_secrets(self, text: str, source: str) -> List[Dict]:
+        """Apply all patterns to arbitrary text."""
+        findings = []
+        for label, pattern, severity in self.SECRET_PATTERNS:
+            for m in re.finditer(pattern, text, re.IGNORECASE):
+                findings.append({
+                    "type":     label,
+                    "severity": severity,
+                    "match":    m.group(0)[:200],
+                    "source":   source,
+                })
+        return findings
+
+    def _analyze_cookies(self, cookies) -> List[Dict]:
+        findings = []
+        if not isinstance(cookies, list):
+            return findings
+        for cookie in cookies:
+            name  = cookie.get("name", "").lower()
+            value = str(cookie.get("value", ""))
+            if any(n in name for n in self._AUTH_COOKIE_NAMES) and len(value) > 10:
+                findings.append({
+                    "type":     "Auth Cookie",
+                    "severity": "HIGH",
+                    "field":    cookie.get("name"),
+                    "value":    value[:200],
+                    "notes":    f"httpOnly={cookie.get('httpOnly', '?')} secure={cookie.get('secure', '?')}",
+                    "source":   "cookies",
+                })
+            findings.extend(self._find_secrets(value, f"cookie:{cookie.get('name')}"))
+        return findings
+
+    def _analyze_storage(self, storage, store_type: str) -> List[Dict]:
+        findings = []
+        if isinstance(storage, list):
+            storage = {item.get("key", ""): item.get("value", "") for item in storage}
+        if not isinstance(storage, dict):
+            return findings
+        sensitive = {"token", "auth", "jwt", "session", "user", "access", "refresh", "key", "secret", "api", "password"}
+        for key, value in storage.items():
+            sv = str(value)
+            if any(s in key.lower() for s in sensitive):
+                findings.append({
+                    "type":     f"Sensitive {store_type} Key",
+                    "severity": "HIGH",
+                    "field":    key,
+                    "value":    sv[:200],
+                    "source":   store_type,
+                })
+            findings.extend(self._find_secrets(sv, f"{store_type}:{key}"))
+        return findings
+
+    def _analyze_xhr(self, calls) -> List[Dict]:
+        findings = []
+        if not isinstance(calls, list):
+            return findings
+        for call in calls:
+            url = call.get("url", "")
+            # Request headers
+            headers = call.get("requestHeaders", {}) or {}
+            if isinstance(headers, dict):
+                for hdr, val in headers.items():
+                    if hdr.lower() in {"authorization", "x-api-key", "x-auth-token"}:
+                        findings.append({
+                            "type":     "Auth Header in XHR",
+                            "severity": "CRITICAL",
+                            "field":    hdr,
+                            "value":    str(val)[:200],
+                            "source":   f"xhr_request:{url}",
+                        })
+                    findings.extend(self._find_secrets(str(val), f"xhr_header:{hdr}"))
+            # Request + response bodies
+            for part in ("requestBody", "responseBody"):
+                body = str(call.get(part, "") or "")
+                findings.extend(self._find_secrets(body, f"xhr_{part}:{url}"))
+        return findings
+
+    def _analyze_form_posts(self, posts) -> List[Dict]:
+        findings = []
+        if not isinstance(posts, list):
+            return findings
+        for post in posts:
+            fields = post.get("fields", {}) or {}
+            if isinstance(fields, list):
+                fields = {item.get("name", ""): item.get("value", "") for item in fields}
+            action = post.get("action", "")
+            for field_name, field_value in fields.items():
+                if any(c in field_name.lower() for c in self._CRED_FIELDS):
+                    findings.append({
+                        "type":     "Credential Capture",
+                        "severity": "CRITICAL",
+                        "field":    field_name,
+                        "value":    str(field_value)[:100],
+                        "source":   f"form_post:{action}",
+                    })
+        return findings
+
+    def _analyze_user_inputs(self, inputs) -> List[Dict]:
+        findings = []
+        if not isinstance(inputs, list):
+            return findings
+        for ui in inputs:
+            text = str(ui.get("data", "") or "")
+            findings.extend(self._find_secrets(text, "user_input"))
+        return findings
+
+    def _fetch_loot(self, session, beacon_url: str, client_id: str) -> Dict:
+        """Fetch all loot event types from JS-Tap."""
+        endpoints = {
+            "cookies":        f"/api/clientCookies/{client_id}",
+            "localStorage":   f"/api/clientLocalStorage/{client_id}",
+            "sessionStorage": f"/api/clientSessionStorage/{client_id}",
+            "xhrCalls":       f"/api/clientXhrApiCall/{client_id}",
+            "fetchCalls":     f"/api/clientFetchApiCall/{client_id}",
+            "formPosts":      f"/api/clientFormPost/{client_id}",
+            "userInputs":     f"/api/clientUserInput/{client_id}",
+            "screenshots":    f"/api/clientScreenshot/{client_id}",
+        }
+        raw = {}
+        for key, path in endpoints.items():
+            try:
+                r = session.get(f"{beacon_url}{path}", timeout=10, verify=False)
+                raw[key] = r.json() if r.ok else []
+            except Exception:
+                raw[key] = []
+        return raw
+
+    def run(
+        self,
+        client_id: str,
+        beacon_url: str = "http://localhost:8444",
+        username: str = "",
+        password: str = "",
+    ) -> Dict:
+        # Authenticate with JS-Tap
+        sess = requests.Session()
+        sess.verify = False
+        if username and password:
+            try:
+                sess.post(
+                    f"{beacon_url}/login",
+                    data={"username": username, "password": password},
+                    timeout=10,
+                )
+            except Exception as e:
+                logger.warning(f"JS-Tap login failed: {e}")
+
+        raw = self._fetch_loot(sess, beacon_url, client_id)
+        loot_summary = {k: len(v) if isinstance(v, list) else (1 if v else 0) for k, v in raw.items()}
+
+        all_findings: List[Dict] = []
+        all_findings.extend(self._analyze_cookies(raw.get("cookies", [])))
+        all_findings.extend(self._analyze_storage(raw.get("localStorage", {}), "localStorage"))
+        all_findings.extend(self._analyze_storage(raw.get("sessionStorage", {}), "sessionStorage"))
+        all_findings.extend(self._analyze_xhr(raw.get("xhrCalls", []) + raw.get("fetchCalls", [])))
+        all_findings.extend(self._analyze_form_posts(raw.get("formPosts", [])))
+        all_findings.extend(self._analyze_user_inputs(raw.get("userInputs", [])))
+
+        # Deduplicate
+        seen: set = set()
+        unique: List[Dict] = []
+        for f in all_findings:
+            key = (f.get("type"), str(f.get("value", f.get("match", "")))[:50])
+            if key not in seen:
+                seen.add(key)
+                unique.append(f)
+
+        sev_order = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3}
+        unique.sort(key=lambda x: sev_order.get(x.get("severity", "LOW"), 99))
+
+        return {
+            "client_id":      client_id,
+            "loot_summary":   loot_summary,
+            "total_findings": len(unique),
+            "critical":       sum(1 for f in unique if f.get("severity") == "CRITICAL"),
+            "high":           sum(1 for f in unique if f.get("severity") == "HIGH"),
+            "medium":         sum(1 for f in unique if f.get("severity") == "MEDIUM"),
+            "findings":       unique,
+            "raw_loot":       {k: v for k, v in raw.items() if k != "screenshots"},
+        }
+
+
+loot_intelligence = LootIntelligence()
+
+
+@app.route("/api/tools/loot/analyze", methods=["POST"])
+def loot_analyze_route():
+    try:
+        params = request.json or {}
+        result = loot_intelligence.run(
+            client_id=params.get("client_id", ""),
+            beacon_url=params.get("beacon_url", "http://localhost:8444"),
+            username=params.get("username", ""),
+            password=params.get("password", ""),
+        )
+        return jsonify(result)
+    except Exception as e:
+        logger.error(f"💥 loot/analyze error: {e}")
+        return jsonify({"error": f"Server error: {e}"}), 500
+
+
 # Create the banner after all classes are defined
 BANNER = ModernVisualEngine.create_banner()
 

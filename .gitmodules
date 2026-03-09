@@ -1,0 +1,3 @@
+[submodule "tools/jstap"]
+	path = tools/jstap
+	url = https://github.com/hoodoer/JS-Tap

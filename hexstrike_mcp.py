@@ -9276,6 +9276,305 @@ def setup_mcp_server(hexstrike_client: HexStrikeClient) -> FastMCP:
         )
         return {"output": "\n".join(lines), "data": result}
 
+    @mcp.tool()
+    def sqli_scan(
+        target: str,
+        run_error: bool = True,
+        run_time: bool = True,
+        run_union: bool = True,
+        run_nosql: bool = True,
+        run_sqlmap: bool = False,
+        sqlmap_level: int = 1,
+        sqlmap_risk: int = 1,
+        custom_params: Optional[dict] = None,
+    ) -> dict:
+        """
+        SQL Injection scanner — error-based, blind time-based, UNION, NoSQL, and optional sqlmap.
+
+        Args:
+            target: Full URL to test (include query params for best results, e.g. https://site.com/search?q=test)
+            run_error: Test for error-based SQLi (MySQL/MSSQL/Oracle/PostgreSQL/SQLite patterns)
+            run_time: Test for blind time-based SQLi (SLEEP/WAITFOR/pg_sleep)
+            run_union: Test for UNION-based data extraction
+            run_nosql: Test for MongoDB operator injection and auth bypass
+            run_sqlmap: Also run sqlmap (requires sqlmap in PATH; slower)
+            sqlmap_level: sqlmap --level (1-5)
+            sqlmap_risk: sqlmap --risk (1-3)
+            custom_params: Override auto-extracted params e.g. {"id": "1", "name": "test"}
+        """
+        result = make_request("POST", "/api/tools/sqli/scan", {
+            "target": target, "run_error": run_error, "run_time": run_time,
+            "run_union": run_union, "run_nosql": run_nosql, "run_sqlmap": run_sqlmap,
+            "sqlmap_level": sqlmap_level, "sqlmap_risk": sqlmap_risk,
+            "custom_params": custom_params,
+        })
+        findings = result.get("findings", [])
+        critical = result.get("critical", 0)
+        high     = result.get("high", 0)
+        lines = [
+            f"🗄️  SQL Injection Scan: {target}",
+            f"   Params tested : {', '.join(result.get('params_tested', []))}",
+            f"   Findings      : {len(findings)} ({critical} CRITICAL, {high} HIGH)",
+            f"   Duration      : {result.get('duration_sec', 0)}s",
+            "",
+        ]
+        for f in findings:
+            sev = f.get("severity", "?")
+            ftype = f.get("type", "?")
+            param = f.get("param", "")
+            payload = f.get("payload", "")
+            db = f.get("db", "")
+            lines.append(f"   [{sev}] {ftype} | param={param} | db={db} | payload={payload!r}")
+        sqlmap = result.get("sqlmap", {})
+        if sqlmap.get("available") and sqlmap.get("injectable"):
+            lines.append("\n   [CRITICAL] sqlmap confirmed injectable!")
+        elif sqlmap.get("available") and not sqlmap.get("injectable"):
+            lines.append("\n   sqlmap: no injection found")
+        elif not sqlmap.get("available", True):
+            lines.append("\n   sqlmap: not installed")
+        if not findings:
+            lines.append("   No SQL injection detected.")
+            lines.append("   → Ensure query params are in the URL or pass custom_params.")
+        logger.info(
+            f"{HexStrikeColors.SUCCESS}🗄️  SQLi: {len(findings)} findings "
+            f"({critical} crit) on {target}{HexStrikeColors.RESET}"
+        )
+        return {"output": "\n".join(lines), "data": result}
+
+    @mcp.tool()
+    def upload_test(
+        target: str,
+        upload_url: Optional[str] = None,
+        run_discover: bool = True,
+        run_extension: bool = True,
+        run_mime: bool = True,
+        run_polyglot: bool = True,
+        run_traversal: bool = True,
+        run_double: bool = True,
+        run_svg: bool = True,
+    ) -> dict:
+        """
+        File upload security tester — extension bypass, MIME manipulation, polyglot files,
+        path traversal in filenames, double extension, SVG XSS/SSRF.
+
+        Args:
+            target: Base URL of the target application
+            upload_url: Known upload endpoint (skips discovery if provided)
+            run_discover: Auto-discover upload endpoints
+            run_extension: Test PHP/ASP/JSP/Perl extension bypasses
+            run_mime: Test MIME type spoofing
+            run_polyglot: Test GIF/PNG/JPEG polyglot webshells
+            run_traversal: Test path traversal in filenames
+            run_double: Test double-extension attacks (shell.php.jpg)
+            run_svg: Test SVG upload for XSS/SSRF
+        """
+        result = make_request("POST", "/api/tools/upload/test", {
+            "target": target, "upload_url": upload_url,
+            "run_discover": run_discover, "run_extension": run_extension,
+            "run_mime": run_mime, "run_polyglot": run_polyglot,
+            "run_traversal": run_traversal, "run_double": run_double,
+            "run_svg": run_svg,
+        })
+        findings = result.get("findings", [])
+        critical = result.get("critical", 0)
+        high     = result.get("high", 0)
+        lines = [
+            f"📁 File Upload Tester: {target}",
+            f"   Endpoints tested : {len(result.get('endpoints_tested', []))}",
+            f"   Findings         : {len(findings)} ({critical} CRITICAL, {high} HIGH)",
+            f"   Duration         : {result.get('duration_sec', 0)}s",
+            "",
+        ]
+        for f in findings:
+            sev   = f.get("severity", "?")
+            ftype = f.get("type", "?")
+            ext   = f.get("extension", f.get("filename", f.get("variant", "")))
+            lines.append(f"   [{sev}] {ftype} | {ext} | {f.get('url', '')}")
+        if not findings:
+            lines.append("   No upload vulnerabilities found.")
+            lines.append("   → Provide upload_url directly if auto-discovery missed it.")
+        logger.info(
+            f"{HexStrikeColors.SUCCESS}📁 Upload: {len(findings)} findings "
+            f"({critical} crit) on {target}{HexStrikeColors.RESET}"
+        )
+        return {"output": "\n".join(lines), "data": result}
+
+    @mcp.tool()
+    def mfa_bypass(
+        target: str,
+        mfa_url: Optional[str] = None,
+        session_cookie: Optional[str] = None,
+        otp_field: str = "otp_code",
+        run_discover: bool = True,
+        run_bruteforce: bool = True,
+        run_backup: bool = True,
+        run_response: bool = True,
+        run_ip_bypass: bool = True,
+        run_skip: bool = True,
+        post_mfa_path: str = "/dashboard",
+    ) -> dict:
+        """
+        2FA/MFA bypass tester — TOTP brute-force, backup code spray, IP header bypass,
+        response manipulation detection, and forced-browse skip.
+
+        Args:
+            target: Base URL of the target application
+            mfa_url: Known MFA endpoint (skips discovery)
+            session_cookie: Session cookie from a valid login (Cookie: header value)
+            otp_field: Form field name for OTP submission (default: otp_code)
+            run_discover: Auto-discover MFA endpoints
+            run_bruteforce: Brute-force TOTP codes 000000-009999 (subset probe)
+            run_backup: Test common backup/recovery codes
+            run_response: Check if server returns same response regardless of OTP
+            run_ip_bypass: Test X-Forwarded-For / X-Real-IP localhost bypass
+            run_skip: Attempt to directly access post-MFA resource (forced browsing)
+            post_mfa_path: Path to test for MFA skip (default: /dashboard)
+        """
+        result = make_request("POST", "/api/tools/mfa/bypass", {
+            "target": target, "mfa_url": mfa_url, "session_cookie": session_cookie,
+            "otp_field": otp_field, "run_discover": run_discover,
+            "run_bruteforce": run_bruteforce, "run_backup": run_backup,
+            "run_response": run_response, "run_ip_bypass": run_ip_bypass,
+            "run_skip": run_skip, "post_mfa_path": post_mfa_path,
+        })
+        findings = result.get("findings", [])
+        critical = result.get("critical", 0)
+        high     = result.get("high", 0)
+        bf       = result.get("bruteforce", {})
+        lines = [
+            f"🔐 MFA Bypass Tester: {target}",
+            f"   Endpoints tested : {len(result.get('endpoints_tested', []))}",
+            f"   Findings         : {len(findings)} ({critical} CRITICAL, {high} HIGH)",
+            f"   Duration         : {result.get('duration_sec', 0)}s",
+            "",
+        ]
+        if bf:
+            lines.append(f"   Brute-force: {bf.get('result', '?')} ({bf.get('codes_tried', 0)} codes tried)")
+            if bf.get("result") == "bypass":
+                lines.append(f"   [CRITICAL] Valid OTP found: {bf.get('code')}")
+        for f in findings:
+            lines.append(f"   [{f.get('severity','?')}] {f.get('type','?')} — {f.get('note', f.get('url',''))}")
+        if not findings and bf.get("result") != "bypass":
+            lines.append("   No MFA bypass found.")
+            lines.append("   → Provide session_cookie from a valid post-login state for best results.")
+        logger.info(
+            f"{HexStrikeColors.SUCCESS}🔐 MFA: {len(findings)} findings "
+            f"({critical} crit) on {target}{HexStrikeColors.RESET}"
+        )
+        return {"output": "\n".join(lines), "data": result}
+
+    @mcp.tool()
+    def idor_scan(
+        target: str,
+        auth_token: Optional[str] = None,
+        admin_token: Optional[str] = None,
+        probe_range: int = 20,
+        run_horizontal: bool = True,
+        run_vertical: bool = True,
+        run_unauth: bool = True,
+        custom_endpoints: Optional[List[str]] = None,
+    ) -> dict:
+        """
+        IDOR/BOLA scanner — horizontal access (neighbouring IDs), vertical privilege escalation,
+        and unauthenticated access probes.
+
+        Args:
+            target: Base URL or specific endpoint with ID param (e.g. https://api.site.com/users/42)
+            auth_token: Bearer token for a regular user
+            admin_token: Bearer token for an admin user (enables vertical priv-esc tests)
+            probe_range: Number of IDs to probe above/below the discovered ID (default: 20)
+            run_horizontal: Test access to neighbouring object IDs
+            run_vertical: Test low-priv access to admin-only endpoints (requires admin_token)
+            run_unauth: Test if endpoints are accessible without any authentication
+            custom_endpoints: List of specific URLs to test (overrides base URL discovery)
+        """
+        result = make_request("POST", "/api/tools/idor/scan", {
+            "target": target, "auth_token": auth_token, "admin_token": admin_token,
+            "probe_range": probe_range, "run_horizontal": run_horizontal,
+            "run_vertical": run_vertical, "run_unauth": run_unauth,
+            "custom_endpoints": custom_endpoints,
+        })
+        findings = result.get("findings", [])
+        critical = result.get("critical", 0)
+        high     = result.get("high", 0)
+        lines = [
+            f"🔓 IDOR/BOLA Scanner: {target}",
+            f"   Endpoints tested : {len(result.get('endpoints_tested', []))}",
+            f"   Findings         : {len(findings)} ({critical} CRITICAL, {high} HIGH)",
+            f"   Duration         : {result.get('duration_sec', 0)}s",
+            "",
+        ]
+        for f in findings:
+            ftype = f.get("type", "?")
+            sev   = f.get("severity", "?")
+            note  = f.get("note", "")
+            accessed = f.get("accessed_id", "")
+            lines.append(f"   [{sev}] {ftype} | id={accessed} | {note} | {f.get('url','')}")
+        if not findings:
+            lines.append("   No IDOR vulnerabilities detected.")
+            lines.append("   → Include IDs in the target URL or pass custom_endpoints with ID-bearing paths.")
+            lines.append("   → Provide auth_token + admin_token for vertical priv-esc testing.")
+        logger.info(
+            f"{HexStrikeColors.SUCCESS}🔓 IDOR: {len(findings)} findings "
+            f"({critical} crit) on {target}{HexStrikeColors.RESET}"
+        )
+        return {"output": "\n".join(lines), "data": result}
+
+    @mcp.tool()
+    def saml_attack(
+        target: str,
+        acs_url: Optional[str] = None,
+        valid_saml_response: Optional[str] = None,
+        run_discover: bool = True,
+        run_unsigned: bool = True,
+        run_xxe: bool = True,
+        run_xsw: bool = True,
+        run_replay: bool = True,
+        run_attr: bool = True,
+    ) -> dict:
+        """
+        SAML attack suite — unsigned assertion injection, XXE in assertions, XML Signature
+        Wrapping (XSW), assertion replay, and attribute manipulation for privilege escalation.
+
+        Args:
+            target: Base URL of the service provider
+            acs_url: Known Assertion Consumer Service URL (skips discovery)
+            valid_saml_response: Base64-encoded valid SAML response (enables XSW + replay tests)
+            run_discover: Auto-discover SAML/SSO endpoints
+            run_unsigned: Test if unsigned assertions are accepted
+            run_xxe: Embed XXE payload in SAML assertion
+            run_xsw: XML Signature Wrapping — inject malicious assertion alongside signed one
+            run_replay: Replay a captured valid assertion
+            run_attr: Send assertions with elevated role/admin attributes
+        """
+        result = make_request("POST", "/api/tools/saml/attack", {
+            "target": target, "acs_url": acs_url, "valid_saml_response": valid_saml_response,
+            "run_discover": run_discover, "run_unsigned": run_unsigned,
+            "run_xxe": run_xxe, "run_xsw": run_xsw,
+            "run_replay": run_replay, "run_attr": run_attr,
+        })
+        findings = result.get("findings", [])
+        critical = result.get("critical", 0)
+        high     = result.get("high", 0)
+        lines = [
+            f"🔏 SAML Attack Suite: {target}",
+            f"   Endpoints tested : {len(result.get('endpoints_tested', []))}",
+            f"   Findings         : {len(findings)} ({critical} CRITICAL, {high} HIGH)",
+            f"   Duration         : {result.get('duration_sec', 0)}s",
+            "",
+        ]
+        for f in findings:
+            lines.append(f"   [{f.get('severity','?')}] {f.get('type','?')} — {f.get('note', f.get('url',''))}")
+        if not findings:
+            lines.append("   No SAML vulnerabilities detected.")
+            lines.append("   → Provide acs_url directly if auto-discovery missed it.")
+            lines.append("   → Capture a valid SAMLResponse and pass as valid_saml_response for XSW/replay.")
+        logger.info(
+            f"{HexStrikeColors.SUCCESS}🔏 SAML: {len(findings)} findings "
+            f"({critical} crit) on {target}{HexStrikeColors.RESET}"
+        )
+        return {"output": "\n".join(lines), "data": result}
+
     return mcp
 
 def parse_args():

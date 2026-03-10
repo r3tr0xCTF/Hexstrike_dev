@@ -7662,6 +7662,180 @@ def setup_mcp_server(hexstrike_client: HexStrikeClient) -> FastMCP:
         )
         return {"output": "\n".join(lines), "data": result}
 
+    @mcp.tool()
+    def graphql_recon(
+        target: str,
+        run_graphw00f: bool = True,
+        run_introspection: bool = True,
+        run_clairvoyance: bool = True,
+        run_inql: bool = True,
+        check_vulns: bool = True,
+    ) -> Dict[str, Any]:
+        """
+        Full GraphQL reconnaissance and vulnerability assessment pipeline.
+
+        Stage 1 — Endpoint Discovery:
+          Probes 18 common GraphQL paths (/graphql, /graphiql, /api/graphql,
+          /v1/graphql, /query, /gql, /data, /api/data, /graph, /playground, etc.)
+          Detects GraphQL response signatures in JSON body.
+
+        Stage 2 — Engine Fingerprinting (when run_graphw00f=True):
+          Runs graphw00f if installed, then falls back to manual fingerprinting.
+          Detects 12 engines: Apollo, Hasura, AWS AppSync, GraphQL-PHP, WPGraphQL,
+          Gatsby, Dgraph, Shopify, GitHub, HotChocolate, Strawberry, Graphene.
+          Uses HTTP headers (X-Powered-By, Server), error message patterns,
+          and response field signatures.
+
+        Stage 3 — Introspection (when run_introspection=True):
+          Sends full __schema introspection query to enumerate types, fields,
+          mutations, and subscriptions. Falls back to minimal type-list query
+          if full introspection is restricted.
+
+        Stage 4 — Clairvoyance (when run_clairvoyance=True):
+          Runs clairvoyance if installed to recover schema when introspection
+          is disabled via field suggestion word-list probing.
+
+        Stage 5 — Vulnerability Checks (when check_vulns=True):
+          ┌─────────────────────────────────────────────────────┐
+          │  Check                │ Technique                   │
+          ├─────────────────────────────────────────────────────┤
+          │  Introspection open   │ Full __schema query         │
+          │  Field suggestions    │ "Did you mean X?" leakage   │
+          │  Batch queries        │ Array of operations         │
+          │  No depth limit       │ 10-level nested depth bomb  │
+          │  Mutations via GET    │ CSRF / method override      │
+          │  Playground exposed   │ GraphiQL / Apollo Sandbox   │
+          └─────────────────────────────────────────────────────┘
+
+        Stage 6 — Schema Analysis (requires successful introspection):
+          Flags sensitive field names (password, token, secret, key, auth,
+          credit_card, ssn, private_key, otp, 2fa, mfa, billing, etc.)
+          Flags dangerous mutation prefixes (delete, drop, remove, purge,
+          create, update, reset, grant, revoke, execute, admin)
+          Flags interesting type names (Admin, User, Auth, Token, Secret,
+          Permission, Role, Config, Internal, etc.)
+
+        Stage 7 — InQL Scanner (when run_inql=True):
+          Runs InQL if installed to generate per-operation query templates
+          and Burp Suite extension files.
+
+        Args:
+            target:            Target URL (e.g. https://example.com or https://api.example.com/graphql)
+            run_graphw00f:     Run graphw00f engine fingerprinting (default True)
+            run_introspection: Attempt full schema introspection (default True)
+            run_clairvoyance:  Run clairvoyance schema recovery if introspection disabled (default True)
+            run_inql:          Run InQL scanner for query generation (default True)
+            check_vulns:       Run all 6 vulnerability checks (default True)
+
+        Returns:
+            Discovered endpoint, engine, introspection schema, vulnerability
+            findings with severity, schema analysis, and InQL output.
+        """
+        resp = requests.post(
+            f"{BASE_URL}/api/tools/graphql/recon",
+            json={
+                "target":            target,
+                "run_graphw00f":     run_graphw00f,
+                "run_introspection": run_introspection,
+                "run_clairvoyance":  run_clairvoyance,
+                "run_inql":          run_inql,
+                "check_vulns":       check_vulns,
+            },
+            timeout=300,
+        )
+        result = resp.json()
+
+        endpoint  = result.get("endpoint", "Not found")
+        engine    = result.get("engine", {})
+        intros    = result.get("introspection", {})
+        schema_an = result.get("schema_analysis", {})
+        vulns     = result.get("vulnerabilities", [])
+        critical  = result.get("critical", 0)
+        high      = result.get("high", 0)
+        medium    = result.get("medium", 0)
+
+        lines = [
+            f"🕸️  GraphQL Recon — {target}",
+            f"   Endpoint     : {endpoint}",
+            f"   Engine       : {engine.get('engine', 'Unknown')} (confidence {engine.get('confidence', 0):.0%})",
+            f"   Introspection: {'✅ OPEN' if intros.get('success') else '❌ Disabled'}",
+            f"   🚨 CRITICAL  : {critical}",
+            f"   🔴 HIGH      : {high}",
+            f"   🟡 MEDIUM    : {medium}",
+            f"   ⏱  Duration  : {result.get('duration_sec', 0)}s",
+            "",
+        ]
+
+        if engine.get("evidence"):
+            lines.append(f"🔍 Engine Evidence: {engine['evidence']}")
+            lines.append("")
+
+        if vulns:
+            lines.append("🚨 VULNERABILITIES:")
+            for v in vulns:
+                sev   = v.get("severity", "INFO")
+                emoji = {"CRITICAL": "🚨", "HIGH": "🔴", "MEDIUM": "🟡", "LOW": "🔵", "INFO": "ℹ️"}.get(sev, "ℹ️")
+                lines.append(f"  {emoji} [{sev}] {v.get('check', '?')}")
+                lines.append(f"       Detail : {v.get('detail', '')}")
+                if v.get("evidence"):
+                    lines.append(f"       Evidence: {str(v['evidence'])[:120]}")
+                lines.append("")
+
+        if schema_an:
+            if schema_an.get("sensitive_fields"):
+                lines.append(f"⚠️  SENSITIVE FIELDS ({len(schema_an['sensitive_fields'])}):")
+                for sf in schema_an["sensitive_fields"][:15]:
+                    lines.append(f"   {sf.get('type','?')}.{sf.get('field','?')} ({sf.get('field_type','?')})")
+                if len(schema_an["sensitive_fields"]) > 15:
+                    lines.append(f"   ... and {len(schema_an['sensitive_fields']) - 15} more")
+                lines.append("")
+
+            if schema_an.get("dangerous_mutations"):
+                lines.append(f"💀 DANGEROUS MUTATIONS ({len(schema_an['dangerous_mutations'])}):")
+                for m in schema_an["dangerous_mutations"][:10]:
+                    lines.append(f"   {m.get('name','?')} — {m.get('reason','?')}")
+                if len(schema_an["dangerous_mutations"]) > 10:
+                    lines.append(f"   ... and {len(schema_an['dangerous_mutations']) - 10} more")
+                lines.append("")
+
+            if schema_an.get("interesting_types"):
+                lines.append(f"🔎 INTERESTING TYPES: {', '.join(schema_an['interesting_types'][:12])}")
+                lines.append("")
+
+            if schema_an.get("stats"):
+                st = schema_an["stats"]
+                lines.append(
+                    f"📊 Schema: {st.get('total_types',0)} types · "
+                    f"{st.get('total_fields',0)} fields · "
+                    f"{st.get('mutation_count',0)} mutations · "
+                    f"{st.get('subscription_count',0)} subscriptions"
+                )
+                lines.append("")
+
+        if intros.get("success") and intros.get("query_type"):
+            lines.append(f"📋 Query root: {intros['query_type']}  |  Mutation root: {intros.get('mutation_type','none')}")
+            lines.append("")
+
+        if result.get("clairvoyance"):
+            lines.append(f"🔮 Clairvoyance: {result['clairvoyance'][:200]}")
+            lines.append("")
+
+        if result.get("inql"):
+            lines.append(f"🔧 InQL: {result['inql'][:200]}")
+            lines.append("")
+
+        if not vulns and not schema_an:
+            if not endpoint or endpoint == "Not found":
+                lines.append("❌ No GraphQL endpoint discovered on target.")
+            else:
+                lines.append("✅ GraphQL endpoint found but no vulnerabilities detected.")
+
+        logger.info(
+            f"{HexStrikeColors.SUCCESS}🕸️  GraphQL: {len(vulns)} vulns "
+            f"({critical} crit) on {target}{HexStrikeColors.RESET}"
+        )
+        return {"output": "\n".join(lines), "data": result}
+
     return mcp
 
 def parse_args():

@@ -22182,6 +22182,590 @@ def ssrf_scan_route():
         return jsonify({"error": f"Server error: {e}"}), 500
 
 
+# ─────────────────────────────────────────────────────────
+#  GRAPHQL RECON
+# ─────────────────────────────────────────────────────────
+class GraphQLRecon:
+    """
+    Full GraphQL reconnaissance:
+      1. Endpoint discovery across common paths
+      2. Engine fingerprinting via graphw00f
+      3. Introspection query + full schema extraction
+      4. Field suggestion leak (clairvoyance) when introspection is off
+      5. Vulnerability checks: batch queries, depth bombs, CSRF via GET,
+         playground exposure, dangerous mutations, sensitive field exposure
+      6. Schema analysis: flag sensitive fields, summarise all types
+      7. InQL integration for attack query generation
+    """
+
+    # Ordered from most to least common
+    COMMON_ENDPOINTS = [
+        "/graphql",
+        "/graphiql",
+        "/api/graphql",
+        "/api/graphiql",
+        "/v1/graphql",
+        "/graphql/v1",
+        "/graphql/v2",
+        "/query",
+        "/gql",
+        "/graph",
+        "/graphql/api",
+        "/graphql/console",
+        "/playground",
+        "/altair",
+        "/api/graph",
+        "/api/query",
+        "/subscriptions",
+        "/graphql/playground",
+    ]
+
+    # Full introspection query
+    INTROSPECTION_QUERY = """
+    {
+      __schema {
+        queryType { name }
+        mutationType { name }
+        subscriptionType { name }
+        types {
+          name
+          kind
+          description
+          fields(includeDeprecated: true) {
+            name
+            description
+            isDeprecated
+            deprecationReason
+            type { name kind ofType { name kind ofType { name kind } } }
+            args {
+              name
+              type { name kind ofType { name kind } }
+              defaultValue
+            }
+          }
+          inputFields {
+            name
+            type { name kind ofType { name kind } }
+          }
+          enumValues(includeDeprecated: true) { name }
+        }
+        directives { name locations args { name } }
+      }
+    }
+    """
+
+    # Minimal introspection — less likely to be blocked
+    MINIMAL_INTROSPECTION = '{ __schema { types { name kind } } }'
+
+    # Schema-type introspection for a specific type
+    TYPE_QUERY = '{ __type(name: "%s") { name fields { name type { name kind } } } }'
+
+    # Deeply nested query — tests for missing depth/complexity limits
+    DEPTH_BOMB = "{ a: __typename { b: __typename { c: __typename { d: __typename { e: __typename { f: __typename { g: __typename { h: __typename { i: __typename { j: __typename } } } } } } } } } }"
+
+    # Sensitive field/type names — flag these in schema analysis
+    _SENSITIVE_FIELDS = {
+        "password", "passwd", "secret", "token", "apikey", "api_key",
+        "auth", "authorization", "credential", "credentials", "private",
+        "admin", "role", "permission", "permissions", "scope",
+        "email", "ssn", "credit_card", "creditcard", "card", "billing",
+        "hash", "salt", "otp", "mfa", "session", "cookie", "jwt",
+        "key", "private_key", "access_token", "refresh_token", "id_token",
+    }
+
+    # Dangerous mutation verb prefixes
+    _DANGEROUS_MUTATIONS = {
+        "delete", "remove", "destroy", "drop",
+        "create", "register", "add", "insert",
+        "update", "edit", "modify", "change",
+        "reset", "revoke", "disable", "enable",
+        "grant", "elevate", "promote", "impersonate",
+    }
+
+    # Known GraphQL error response substrings per engine
+    _ENGINE_FINGERPRINTS = {
+        "Apollo":          ["GraphQL error", "Cannot query field", "ApolloError"],
+        "Hasura":          ["not found in type", "field 'query' not found", "x-hasura"],
+        "GraphQL-go":      ["graphql: "],
+        "Graphene":        ["GraphQLError", "graphene"],
+        "HotChocolate":    ["HC0", "HotChocolate"],
+        "AWS AppSync":     ["x-amzn-requestid", "amzn"],
+        "Dgraph":          ["dgraph"],
+        "WPGraphQL":       ["wp-graphql", "WordPress"],
+        "Strawberry":      ["strawberry"],
+        "Ariadne":         ["ariadne"],
+        "GraphQL-Ruby":    ["GraphQL::ExecutionError", "ruby"],
+        "Lighthouse":      ["lighthouse"],
+    }
+
+    # ── Helpers ──────────────────────────────────────────────────────────────
+
+    def _gql_post(self, endpoint: str, query: str, headers: Dict = None, use_get: bool = False) -> Optional[requests.Response]:
+        h = {"Content-Type": "application/json", "User-Agent": "Mozilla/5.0"}
+        if headers:
+            h.update(headers)
+        try:
+            if use_get:
+                return requests.get(endpoint, params={"query": query}, headers=h,
+                                    timeout=10, verify=False)
+            return requests.post(endpoint, json={"query": query}, headers=h,
+                                 timeout=10, verify=False)
+        except Exception:
+            return None
+
+    def _is_graphql_response(self, r: requests.Response) -> bool:
+        """Check if a response looks like it came from a GraphQL server."""
+        if r is None:
+            return False
+        ct   = r.headers.get("content-type", "")
+        body = r.text
+        return (
+            "application/json" in ct or "application/graphql" in ct
+        ) and (
+            '"data"' in body or '"errors"' in body or "__schema" in body
+        )
+
+    # ── Stage 1: Endpoint Discovery ──────────────────────────────────────────
+
+    def _discover_endpoint(self, target: str) -> Optional[str]:
+        from urllib.parse import urlparse
+        parsed = urlparse(target)
+        base   = f"{parsed.scheme}://{parsed.netloc}"
+
+        # If target already looks like an endpoint, try it first
+        if any(ep in parsed.path for ep in self.COMMON_ENDPOINTS):
+            r = self._gql_post(target, '{ __typename }')
+            if r and self._is_graphql_response(r):
+                return target
+
+        for ep in self.COMMON_ENDPOINTS:
+            url = base + ep
+            r   = self._gql_post(url, '{ __typename }')
+            if r and self._is_graphql_response(r):
+                logger.info(f"GraphQL: endpoint found at {url}")
+                return url
+
+        # Also check for playground/GraphiQL UI (GET)
+        for ep in ["/graphiql", "/playground", "/altair", "/graphql/console"]:
+            url = base + ep
+            try:
+                r = requests.get(url, timeout=8, verify=False)
+                if r.ok and any(kw in r.text for kw in ["graphiql", "playground", "graphql"]):
+                    logger.info(f"GraphQL: playground UI at {url}")
+                    return base + "/graphql"  # Assume API at /graphql
+            except Exception:
+                pass
+        return None
+
+    # ── Stage 2: Engine Fingerprinting ───────────────────────────────────────
+
+    def _fingerprint_engine(self, endpoint: str) -> Dict:
+        """graphw00f + header/response-based fingerprinting."""
+        result: Dict = {"engine": "Unknown", "version": None, "source": ""}
+
+        # graphw00f (if installed)
+        try:
+            res = subprocess.run(
+                ["graphw00f", "-t", endpoint, "-f"],
+                capture_output=True, text=True, timeout=30,
+            )
+            out = res.stdout + res.stderr
+            for engine in ["Apollo", "Hasura", "Graphene", "HotChocolate",
+                           "AWS AppSync", "Dgraph", "WPGraphQL", "Strawberry",
+                           "Ariadne", "GraphQL-Ruby", "Lighthouse", "Relay"]:
+                if engine.lower() in out.lower():
+                    result.update({"engine": engine, "source": "graphw00f"})
+                    break
+        except FileNotFoundError:
+            logger.debug("graphw00f not installed — using manual fingerprinting")
+
+        if result["engine"] != "Unknown":
+            return result
+
+        # Manual: probe with bad query, analyse error + headers
+        r = self._gql_post(endpoint, '{ invalid_field_hxs }')
+        if r:
+            body = r.text
+            hdrs = {k.lower(): v for k, v in r.headers.items()}
+            # Header-based
+            for h in ["x-powered-by", "server", "x-hasura-trace-id", "x-amzn-requestid"]:
+                if h in hdrs:
+                    result.update({"engine": hdrs[h], "source": f"header:{h}"})
+                    break
+            # Body-based
+            if result["engine"] == "Unknown":
+                for engine, patterns in self._ENGINE_FINGERPRINTS.items():
+                    if any(p.lower() in body.lower() for p in patterns):
+                        result.update({"engine": engine, "source": "error_response"})
+                        break
+        return result
+
+    # ── Stage 3: Introspection ───────────────────────────────────────────────
+
+    def _run_introspection(self, endpoint: str) -> Dict:
+        result = {"enabled": False, "schema": None, "method": None}
+
+        # Full introspection
+        r = self._gql_post(endpoint, self.INTROSPECTION_QUERY)
+        if r and '"__schema"' in r.text:
+            try:
+                data = r.json()
+                schema = data.get("data", {}).get("__schema")
+                if schema:
+                    result.update({"enabled": True, "schema": schema, "method": "full"})
+                    return result
+            except Exception:
+                pass
+
+        # Minimal introspection (sometimes less restricted)
+        r = self._gql_post(endpoint, self.MINIMAL_INTROSPECTION)
+        if r and '"__schema"' in r.text:
+            try:
+                data = r.json()
+                schema = data.get("data", {}).get("__schema")
+                if schema:
+                    result.update({"enabled": True, "schema": schema, "method": "minimal"})
+            except Exception:
+                pass
+
+        return result
+
+    # ── Stage 4: Field Suggestions (clairvoyance fallback) ──────────────────
+
+    def _check_field_suggestions(self, endpoint: str) -> Dict:
+        """
+        Check if the server leaks 'Did you mean X?' suggestions —
+        exploited by clairvoyance to reconstruct the schema.
+        """
+        result = {"enabled": False, "example": None}
+        r = self._gql_post(endpoint, '{ nonExistentField_hxs_probe }')
+        if r:
+            body = r.text
+            if "did you mean" in body.lower() or "suggestions" in body.lower():
+                result["enabled"] = True
+                m = re.search(r'"([^"]{2,40})"', body)
+                result["example"] = m.group(1) if m else None
+        return result
+
+    def _run_clairvoyance(self, endpoint: str) -> Optional[str]:
+        """Run clairvoyance if installed — returns JSON schema string."""
+        try:
+            res = subprocess.run(
+                ["clairvoyance", "-u", endpoint, "--timeout", "30"],
+                capture_output=True, text=True, timeout=120,
+            )
+            if res.stdout and "{" in res.stdout:
+                return res.stdout[:5000]
+        except FileNotFoundError:
+            logger.debug("clairvoyance not installed — skipping")
+        return None
+
+    # ── Stage 5: Vulnerability Checks ───────────────────────────────────────
+
+    def _check_batch_queries(self, endpoint: str) -> Dict:
+        """Test if the server allows batched query arrays."""
+        result = {"enabled": False, "note": ""}
+        try:
+            r = requests.post(
+                endpoint,
+                json=[{"query": "{ __typename }"}, {"query": "{ __typename }"}],
+                headers={"Content-Type": "application/json", "User-Agent": "Mozilla/5.0"},
+                timeout=10, verify=False,
+            )
+            if r.ok:
+                body = r.text
+                if isinstance(r.json(), list) or body.count('"__typename"') >= 2:
+                    result.update({"enabled": True, "note": "Server accepts array of operations"})
+        except Exception:
+            pass
+        return result
+
+    def _check_depth_limit(self, endpoint: str) -> Dict:
+        """Send a deeply nested query and check if it's rejected."""
+        result = {"limited": False, "note": ""}
+        r = self._gql_post(endpoint, self.DEPTH_BOMB)
+        if r:
+            body = r.text
+            if r.status_code in (400, 429) or "depth" in body.lower() or "complexity" in body.lower():
+                result.update({"limited": True, "note": "Server rejected deep/complex query"})
+            else:
+                result.update({"note": "Server did not reject depth-10 nested query"})
+        return result
+
+    def _check_get_mutations(self, endpoint: str) -> Dict:
+        """Check if mutations work over GET (CSRF risk)."""
+        result = {"vulnerable": False, "note": ""}
+        test_query = "mutation { __typename }"
+        r = self._gql_post(endpoint, test_query, use_get=True)
+        if r and r.ok and '"data"' in r.text:
+            result.update({"vulnerable": True, "note": "Mutations accepted via GET — CSRF risk"})
+        return result
+
+    def _check_playground(self, endpoint: str) -> Dict:
+        """Check if GraphiQL/Playground UI is publicly accessible."""
+        from urllib.parse import urlparse
+        result = {"exposed": False, "urls": []}
+        parsed  = urlparse(endpoint)
+        base    = f"{parsed.scheme}://{parsed.netloc}"
+        for ui_path in ["/graphiql", "/playground", "/altair", "/graphql/console", "/graphql/playground"]:
+            try:
+                r = requests.get(base + ui_path, timeout=8, verify=False)
+                if r.ok and any(kw in r.text.lower() for kw in ["graphiql", "playground", "graphql"]):
+                    result["exposed"] = True
+                    result["urls"].append(base + ui_path)
+            except Exception:
+                pass
+        return result
+
+    # ── Stage 6: Schema Analysis ─────────────────────────────────────────────
+
+    def _analyze_schema(self, schema: Dict) -> Dict:
+        if not schema:
+            return {}
+
+        types         = schema.get("types", [])
+        query_root    = (schema.get("queryType") or {}).get("name", "Query")
+        mutation_root = (schema.get("mutationType") or {}).get("name")
+
+        all_types:       List[Dict] = []
+        sensitive_fields:List[Dict] = []
+        dangerous_mutations:List[Dict] = []
+        interesting_types:List[str] = []
+
+        for t in types:
+            if t.get("name", "").startswith("__"):
+                continue  # skip introspection meta-types
+
+            type_name  = t.get("name", "")
+            type_kind  = t.get("kind", "")
+            fields     = t.get("fields") or []
+
+            type_info = {
+                "name":       type_name,
+                "kind":       type_kind,
+                "field_count": len(fields),
+                "fields":     [f.get("name") for f in fields],
+            }
+            all_types.append(type_info)
+
+            # Sensitive fields
+            for field in fields:
+                fname = field.get("name", "").lower()
+                if any(sf in fname for sf in self._SENSITIVE_FIELDS):
+                    sensitive_fields.append({
+                        "type":     type_name,
+                        "field":    field.get("name"),
+                        "severity": "CRITICAL" if fname in {"password", "secret", "token", "key"} else "HIGH",
+                    })
+
+            # Dangerous mutations
+            if mutation_root and type_name == mutation_root:
+                for field in fields:
+                    fname = field.get("name", "").lower()
+                    if any(fname.startswith(v) for v in self._DANGEROUS_MUTATIONS):
+                        dangerous_mutations.append({
+                            "mutation": field.get("name"),
+                            "args":     [a.get("name") for a in (field.get("args") or [])],
+                            "severity": "HIGH",
+                        })
+
+            # Interesting type names
+            for kw in ["user", "admin", "account", "auth", "token", "secret",
+                       "permission", "role", "config", "setting", "credential"]:
+                if kw in type_name.lower():
+                    interesting_types.append(type_name)
+                    break
+
+        return {
+            "total_types":          len(all_types),
+            "all_types":            all_types,
+            "query_root":           query_root,
+            "mutation_root":        mutation_root,
+            "sensitive_fields":     sensitive_fields,
+            "dangerous_mutations":  dangerous_mutations,
+            "interesting_types":    list(set(interesting_types)),
+            "mutation_count":       len(dangerous_mutations),
+        }
+
+    # ── Stage 7: InQL Integration ────────────────────────────────────────────
+
+    def _run_inql(self, endpoint: str) -> Optional[str]:
+        """Run InQL scanner if installed."""
+        try:
+            res = subprocess.run(
+                ["inql", "-t", endpoint],
+                capture_output=True, text=True, timeout=60,
+            )
+            if res.stdout:
+                return res.stdout[:3000]
+        except FileNotFoundError:
+            logger.debug("inql not installed — skipping")
+        return None
+
+    # ── Orchestrator ─────────────────────────────────────────────────────────
+
+    def run(
+        self,
+        target: str,
+        run_graphw00f: bool = True,
+        run_introspection: bool = True,
+        run_clairvoyance: bool = True,
+        run_inql: bool = True,
+        check_vulns: bool = True,
+    ) -> Dict:
+        _start = time.time()
+
+        # Stage 1: Discover endpoint
+        endpoint = self._discover_endpoint(target)
+        if not endpoint:
+            return {
+                "target":    target,
+                "endpoint":  None,
+                "found":     False,
+                "message":   "No GraphQL endpoint detected on this target.",
+                "duration_sec": round(time.time() - _start, 2),
+            }
+        logger.info(f"GraphQL: using endpoint {endpoint}")
+
+        # Stage 2: Fingerprint
+        engine_info = self._fingerprint_engine(endpoint) if run_graphw00f else {}
+
+        # Stage 3: Introspection
+        intro = self._run_introspection(endpoint) if run_introspection else {"enabled": False, "schema": None}
+
+        # Stage 4: Field suggestions / clairvoyance
+        suggestions   = self._check_field_suggestions(endpoint)
+        clairvoyance  = None
+        if run_clairvoyance and not intro["enabled"] and suggestions["enabled"]:
+            clairvoyance = self._run_clairvoyance(endpoint)
+
+        # Stage 5: Vulnerability checks
+        vulns: List[Dict] = []
+        if check_vulns:
+            if intro["enabled"]:
+                vulns.append({
+                    "name":        "Introspection Enabled",
+                    "severity":    "MEDIUM",
+                    "description": "Full schema disclosed via __schema introspection query.",
+                    "remediation": "Disable introspection in production.",
+                })
+            if suggestions["enabled"]:
+                vulns.append({
+                    "name":        "Field Suggestions Enabled",
+                    "severity":    "MEDIUM",
+                    "description": (
+                        f"Server returns 'Did you mean X?' suggestions, leaking schema "
+                        f"even without introspection. Example: '{suggestions.get('example')}'."
+                    ),
+                    "remediation": "Disable field suggestions in production.",
+                })
+            batch = self._check_batch_queries(endpoint)
+            if batch["enabled"]:
+                vulns.append({
+                    "name":        "Batch Queries Allowed",
+                    "severity":    "HIGH",
+                    "description": "Server accepts arrays of operations — can amplify brute-force/rate-limit bypass.",
+                    "remediation": "Disable or restrict batch query support.",
+                })
+            depth = self._check_depth_limit(endpoint)
+            if not depth["limited"]:
+                vulns.append({
+                    "name":        "No Query Depth / Complexity Limit",
+                    "severity":    "HIGH",
+                    "description": "Server processed a depth-10 nested query without error — DoS via query complexity is possible.",
+                    "remediation": "Implement query depth and complexity limits.",
+                })
+            get_mutation = self._check_get_mutations(endpoint)
+            if get_mutation["vulnerable"]:
+                vulns.append({
+                    "name":        "Mutations Accepted via GET",
+                    "severity":    "HIGH",
+                    "description": "Mutations work over HTTP GET — CSRF attacks possible without CORS.",
+                    "remediation": "Accept mutations via POST only.",
+                })
+            playground = self._check_playground(endpoint)
+            if playground["exposed"]:
+                vulns.append({
+                    "name":        "Playground / GraphiQL UI Exposed",
+                    "severity":    "LOW",
+                    "description": f"Interactive query UI exposed at: {', '.join(playground['urls'])}",
+                    "remediation": "Restrict playground UI to internal networks.",
+                })
+
+        # Stage 6: Schema analysis
+        schema_analysis = self._analyze_schema(intro.get("schema")) if intro.get("schema") else {}
+
+        # Escalate severity for sensitive fields / dangerous mutations
+        if schema_analysis.get("sensitive_fields"):
+            vulns.append({
+                "name":        "Sensitive Fields in Schema",
+                "severity":    "CRITICAL",
+                "description": (
+                    f"{len(schema_analysis['sensitive_fields'])} sensitive field(s) exposed: "
+                    + ", ".join(f"{f['type']}.{f['field']}" for f in schema_analysis["sensitive_fields"][:8])
+                ),
+                "remediation": "Remove sensitive fields from schema or restrict with field-level auth.",
+                "fields":      schema_analysis["sensitive_fields"],
+            })
+        if schema_analysis.get("dangerous_mutations"):
+            vulns.append({
+                "name":        "Dangerous Mutations Exposed",
+                "severity":    "HIGH",
+                "description": (
+                    f"{len(schema_analysis['dangerous_mutations'])} dangerous mutation(s): "
+                    + ", ".join(m["mutation"] for m in schema_analysis["dangerous_mutations"][:8])
+                ),
+                "remediation": "Require authentication/authorisation on all mutation resolvers.",
+                "mutations":   schema_analysis["dangerous_mutations"],
+            })
+
+        # Stage 7: InQL
+        inql_output = self._run_inql(endpoint) if run_inql else None
+
+        # Sort vulns by severity
+        sev_order = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3}
+        vulns.sort(key=lambda x: sev_order.get(x.get("severity", "LOW"), 9))
+
+        return {
+            "target":           target,
+            "endpoint":         endpoint,
+            "found":            True,
+            "engine":           engine_info,
+            "introspection":    intro,
+            "field_suggestions": suggestions,
+            "clairvoyance":     clairvoyance,
+            "schema_analysis":  schema_analysis,
+            "vulnerabilities":  vulns,
+            "inql_output":      inql_output,
+            "vuln_count":       len(vulns),
+            "critical":         sum(1 for v in vulns if v["severity"] == "CRITICAL"),
+            "high":             sum(1 for v in vulns if v["severity"] == "HIGH"),
+            "medium":           sum(1 for v in vulns if v["severity"] == "MEDIUM"),
+            "duration_sec":     round(time.time() - _start, 2),
+        }
+
+
+graphql_recon = GraphQLRecon()
+
+
+@app.route("/api/tools/graphql/recon", methods=["POST"])
+def graphql_recon_route():
+    try:
+        params = request.json or {}
+        result = graphql_recon.run(
+            target=params.get("target", ""),
+            run_graphw00f=bool(params.get("run_graphw00f", True)),
+            run_introspection=bool(params.get("run_introspection", True)),
+            run_clairvoyance=bool(params.get("run_clairvoyance", True)),
+            run_inql=bool(params.get("run_inql", True)),
+            check_vulns=bool(params.get("check_vulns", True)),
+        )
+        return jsonify(result)
+    except Exception as e:
+        logger.error(f"💥 graphql/recon error: {e}")
+        return jsonify({"error": f"Server error: {e}"}), 500
+
+
 # Create the banner after all classes are defined
 BANNER = ModernVisualEngine.create_banner()
 

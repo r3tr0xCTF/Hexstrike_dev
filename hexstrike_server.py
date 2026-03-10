@@ -5708,8 +5708,8 @@ class ProcessManager:
 class PythonEnvironmentManager:
     """Manage Python virtual environments and dependencies"""
 
-    def __init__(self, base_dir: str = "/tmp/hexstrike_envs"):
-        self.base_dir = Path(base_dir)
+    def __init__(self, base_dir: str = ""):
+        self.base_dir = Path(base_dir) if base_dir else Path(tempfile.gettempdir()) / "hexstrike_envs"
         self.base_dir.mkdir(exist_ok=True)
 
     def create_venv(self, env_name: str) -> Path:
@@ -8931,8 +8931,8 @@ def _determine_operation_type(tool_name: str) -> str:
 class FileOperationsManager:
     """Handle file operations with security and validation"""
 
-    def __init__(self, base_dir: str = "/tmp/hexstrike_files"):
-        self.base_dir = Path(base_dir)
+    def __init__(self, base_dir: str = ""):
+        self.base_dir = Path(base_dir) if base_dir else Path(tempfile.gettempdir()) / "hexstrike_files"
         self.base_dir.mkdir(exist_ok=True)
         self.max_file_size = 100 * 1024 * 1024  # 100MB
 

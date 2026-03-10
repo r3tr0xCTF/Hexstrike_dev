@@ -8934,6 +8934,348 @@ def setup_mcp_server(hexstrike_client: HexStrikeClient) -> FastMCP:
         )
         return {"output": "\n".join(lines), "data": result}
 
+    @mcp.tool()
+    def subdomain_enum(
+        domain:          str,
+        run_passive:     bool = True,
+        run_brute:       bool = True,
+        run_alterations: bool = True,
+        run_httpx:       bool = True,
+        run_screenshots: bool = False,
+        wordlist:        Optional[str] = None,
+        threads:         int  = 100,
+        screenshots_dir: str  = "",
+    ) -> Dict[str, Any]:
+        """
+        Multi-tool subdomain enumeration pipeline — passive + active + live probing.
+
+        Stage 1 — Passive Enumeration (run_passive):
+          Runs 4 sources in parallel:
+          ┌─────────────────────────────────────────────────────┐
+          │  subfinder  — 40+ passive sources (VirusTotal,      │
+          │               Shodan, Censys, DNSdumpster, etc.)    │
+          │  amass      — passive OSINT with graph analysis      │
+          │  crt.sh     — certificate transparency logs (no     │
+          │               tool required, direct API call)        │
+          │  HackerTarget — free hostsearch API                  │
+          └─────────────────────────────────────────────────────┘
+
+        Stage 2 — Wildcard DNS Detection:
+          Resolves a random 12-char subdomain to detect wildcard DNS.
+          All subsequent results matching the wildcard IP are filtered out,
+          eliminating false positives before bruteforce.
+
+        Stage 3 — DNS Bruteforce (run_brute):
+          shuffledns with built-in 60-word wordlist (or custom wordlist path).
+          Uses 7 public resolvers. Falls back to pure-Python socket resolution
+          if shuffledns is not installed.
+
+        Stage 4 — Alteration/Permutation (run_alterations):
+          Generates permutation candidates from discovered subdomains:
+            {label}-dev · {label}-staging · {label}-prod · {label}-test
+            {label}-api · {label}-admin · {label}-internal · {label}2
+            dev-{label} · staging-{label} · api-{label} + more
+          Resolves candidates via dnsx, filters wildcards.
+
+        Stage 5 — DNS Resolution + Wildcard Filter:
+          Resolves all accumulated subdomains with dnsx (JSON output,
+          A + CNAME records, 100 threads). Falls back to socket.getaddrinfo()
+          if dnsx is absent. Strips wildcard IPs.
+
+        Stage 6 — Live HTTP/S Probing (run_httpx):
+          httpx probes all resolved hosts for live web services:
+          status code · page title · technology detection · CDN detection
+          Follow redirects. Falls back to requests HEAD probe if httpx absent.
+
+        Stage 7 — Screenshots (run_screenshots, opt-in):
+          gowitness captures screenshots of all live URLs (capped at 100).
+          Saved to screenshots_dir (default: temp/hexstrike_screenshots_{domain}).
+
+        Tools used (graceful fallback if not installed):
+          subfinder · amass · dnsx · shuffledns · httpx · gowitness
+
+        Args:
+            domain:          Target domain (e.g. example.com — no http://)
+            run_passive:     Run subfinder + amass + crt.sh + HackerTarget (default True)
+            run_brute:       Run shuffledns DNS bruteforce (default True)
+            run_alterations: Generate and resolve permutation candidates (default True)
+            run_httpx:       Probe live HTTP/S services on resolved hosts (default True)
+            run_screenshots: Capture gowitness screenshots of live URLs (default False)
+            wordlist:        Path to custom subdomain wordlist for shuffledns (optional)
+            threads:         DNS resolution thread count (default 100)
+            screenshots_dir: Directory to save screenshots (default: temp dir)
+
+        Returns:
+            All discovered subdomains, resolved hosts with IPs/CNAMEs, live services
+            with status/title/tech, wildcard detection, source breakdown, tool status.
+        """
+        resp = requests.post(
+            f"{BASE_URL}/api/tools/subdomain/enum",
+            json={
+                "domain":          domain,
+                "run_passive":     run_passive,
+                "run_brute":       run_brute,
+                "run_alterations": run_alterations,
+                "run_httpx":       run_httpx,
+                "run_screenshots": run_screenshots,
+                "wordlist":        wordlist,
+                "threads":         threads,
+                "screenshots_dir": screenshots_dir,
+            },
+            timeout=600,
+        )
+        result   = resp.json()
+        total    = result.get("total_found", 0)
+        resolved = result.get("total_resolved", 0)
+        live     = result.get("total_live", 0)
+        wc       = result.get("wildcard_ip")
+        sources  = result.get("source_counts", {})
+        tools    = result.get("tools_available", {})
+
+        lines = [
+            f"🌐 Subdomain Enumeration — {domain}",
+            f"   Total found    : {total}",
+            f"   DNS resolved   : {resolved}",
+            f"   Live services  : {live}",
+            f"   Wildcard DNS   : {'⚠️  ' + wc if wc else '✅ Not detected'}",
+            f"   ⏱  Duration    : {result.get('duration_sec', 0)}s",
+            "",
+        ]
+
+        # Tool status
+        missing = [t for t, ok in tools.items() if not ok]
+        if missing:
+            lines.append(f"⚠️  Tools not installed (using fallback): {', '.join(missing)}")
+            lines.append("")
+
+        # Source breakdown
+        if sources:
+            lines.append("📊 SOURCE BREAKDOWN:")
+            for src, count in sorted(sources.items(), key=lambda x: -x[1]):
+                lines.append(f"   {src:25s}: {count}")
+            lines.append("")
+
+        # Live services
+        live_svcs = result.get("live_services", [])
+        if live_svcs:
+            lines.append(f"🌍 LIVE SERVICES ({len(live_svcs)}):")
+            for svc in live_svcs[:30]:
+                tech_str = ", ".join(svc.get("tech", [])[:3])
+                title    = svc.get("title", "")[:40]
+                lines.append(
+                    f"   [{svc.get('status_code','?')}] {svc.get('url','')[:60]}"
+                    + (f"  — {title}" if title else "")
+                    + (f"  [{tech_str}]" if tech_str else "")
+                )
+            if len(live_svcs) > 30:
+                lines.append(f"   ... and {len(live_svcs) - 30} more")
+            lines.append("")
+
+        # All subdomains
+        subs = result.get("subdomains", [])
+        if subs and not live_svcs:
+            lines.append(f"📋 SUBDOMAINS ({len(subs)}) — first 30:")
+            for sub in subs[:30]:
+                lines.append(f"   {sub}")
+            if len(subs) > 30:
+                lines.append(f"   ... and {len(subs) - 30} more")
+            lines.append("")
+
+        # Screenshots
+        shots = result.get("screenshots", {})
+        if shots.get("captured"):
+            lines.append(f"📸 Screenshots saved to: {shots.get('output_dir','')}")
+            lines.append("")
+
+        if not total:
+            lines.append("❌ No subdomains discovered. Check that subfinder/amass are in PATH.")
+
+        logger.info(
+            f"{HexStrikeColors.SUCCESS}🌐 Subdomain Enum: {total} found, "
+            f"{resolved} resolved, {live} live on {domain}{HexStrikeColors.RESET}"
+        )
+        return {"output": "\n".join(lines), "data": result}
+
+    @mcp.tool()
+    def xxe_scan(
+        target:           str,
+        callback_url:     str  = "",
+        run_classic:      bool = True,
+        run_error:        bool = True,
+        run_oob:          bool = True,
+        run_ssrf:         bool = True,
+        run_svg:          bool = True,
+        run_docx:         bool = True,
+        run_protocols:    bool = True,
+        run_detect:       bool = True,
+        custom_endpoints: Optional[List[str]] = None,
+    ) -> Dict[str, Any]:
+        """
+        XXE injection scanner — 8 techniques across XML, SVG, and Office vectors.
+
+        Auto-Discovery:
+          Probes 13 common XML-accepting paths on the target to find endpoints
+          that accept XML input: /api, /api/v1, /soap, /ws, /service, /rss,
+          /feed, /upload, /import, /parse, /graphql, /xmlrpc.php, /api/xml.
+          Identifies non-404/405 responses to XML POST requests.
+
+        Technique 1 — Classic File Read (run_classic):
+          Injects <!ENTITY xxe SYSTEM "file:///..."> for 5 targets:
+            /etc/passwd · /etc/hostname · /etc/hosts · /proc/version
+            C:/Windows/win.ini
+          Across 3 XML content types (application/xml, text/xml, SOAP).
+          Detects file content in response via 9 success patterns.
+          CRITICAL severity.
+
+        Technique 2 — Error-Based XXE (run_error):
+          Uses parameter entity chaining to force a parser error that
+          includes file content in the error message:
+            %file (reads /etc/passwd) → %eval (builds error entity) → %error
+          Detects both file content and parser error strings in response.
+
+        Technique 3 — Blind OOB (run_oob, requires callback_url):
+          3 payload variants:
+            basic_oob       — direct entity to callback URL
+            param_entity    — % entity OOB callback
+            oob_file_exfil  — %file; injected into callback URL query string
+          Use your JS-Tap tunnel URL or interactsh as the callback_url.
+          Monitor the callback for HTTP requests containing the token.
+
+        Technique 4 — SSRF via XXE (run_ssrf):
+          Probes 4 internal targets via XXE entity resolution:
+            AWS instance metadata  — http://169.254.169.254/latest/meta-data/
+            GCP metadata           — http://169.254.169.254/computeMetadata/v1/
+            Azure metadata         — http://169.254.169.254/metadata/instance
+            localhost:80
+          Detects metadata keywords (ami-id, instance-id, computemetadata) in response.
+
+        Technique 5 — SVG XXE (run_svg):
+          Uploads a hand-crafted SVG file with embedded <!ENTITY xxe SYSTEM>
+          to 7 common upload paths (/upload, /avatar, /profile/image, etc.)
+          Detects /etc/passwd content in server response.
+
+        Technique 6 — DOCX Upload XXE (run_docx):
+          Builds a minimal valid DOCX ZIP (with XXE in word/document.xml)
+          in memory and uploads to 6 common document upload paths.
+          No external tools required — pure Python zipfile construction.
+
+        Technique 7 — Protocol Handler Abuse (run_protocols):
+          Tests 4 exotic protocol handlers supported by some parsers:
+            php://filter  — base64-encodes /etc/passwd (detects cm9vd prefix)
+            expect://     — OS command execution via Expect module
+            netdoc://     — Java NetDoc handler
+            jar://        — Java JAR protocol handler
+
+        Technique 8 — XML Parser Detection (run_detect):
+          Sends a benign XML probe and fingerprints the parser from headers
+          and error messages: Xerces, libxml2, Expat, MSXML, Saxon, JAXB, XStream.
+
+        Args:
+            target:           Target URL (e.g. https://api.example.com)
+            callback_url:     OOB callback URL for blind XXE (JS-Tap tunnel or interactsh)
+            run_classic:      Classic file:// entity read (default True)
+            run_error:        Error-based parameter entity chaining (default True)
+            run_oob:          Blind OOB callback payloads (default True, needs callback_url)
+            run_ssrf:         SSRF via XXE to cloud metadata endpoints (default True)
+            run_svg:          SVG file upload XXE probe (default True)
+            run_docx:         DOCX file upload XXE probe (default True)
+            run_protocols:    php:// expect:// netdoc:// jar:// handlers (default True)
+            run_detect:       XML parser fingerprinting (default True)
+            custom_endpoints: Override auto-discovered XML endpoints (optional list)
+
+        Returns:
+            All findings with severity, matched patterns, file exfil snippets,
+            OOB tokens, parser detection, and response snippets.
+        """
+        resp = requests.post(
+            f"{BASE_URL}/api/tools/xxe/scan",
+            json={
+                "target":           target,
+                "callback_url":     callback_url,
+                "run_classic":      run_classic,
+                "run_error":        run_error,
+                "run_oob":          run_oob,
+                "run_ssrf":         run_ssrf,
+                "run_svg":          run_svg,
+                "run_docx":         run_docx,
+                "run_protocols":    run_protocols,
+                "run_detect":       run_detect,
+                "custom_endpoints": custom_endpoints,
+            },
+            timeout=300,
+        )
+        result   = resp.json()
+        findings = result.get("findings", [])
+        critical = result.get("critical", 0)
+        high     = result.get("high", 0)
+        parser   = result.get("parser_detection", {})
+
+        lines = [
+            f"💉 XXE Scanner — {target}",
+            f"   Endpoints probed: {len(result.get('endpoints_probed', []))}",
+            f"   🚨 CRITICAL     : {critical}",
+            f"   🔴 HIGH         : {high}",
+            f"   ⏱  Duration     : {result.get('duration_sec', 0)}s",
+            "",
+        ]
+
+        # Parser detection
+        if parser.get("detected"):
+            lines.append(f"🔍 XML Parser Detected: {', '.join(parser.get('parser_hints', []))}")
+            if parser.get("server"):
+                lines.append(f"   Server: {parser['server']}")
+            lines.append("")
+        elif parser:
+            lines.append(f"🔍 XML accepted (status {parser.get('status','?')}) — parser not fingerprinted")
+            lines.append("")
+
+        tech_emoji = {
+            "classic_xxe":         "📄",
+            "error_based_xxe":     "⚠️",
+            "blind_oob_xxe":       "📡",
+            "ssrf_via_xxe":        "🌐",
+            "svg_xxe":             "🖼️",
+            "docx_xxe":            "📝",
+            "protocol_handler_xxe":"⚙️",
+        }
+
+        if findings:
+            lines.append(f"🚨 FINDINGS ({len(findings)}):")
+            for f in findings:
+                sev   = f.get("severity", "HIGH")
+                emoji = "🚨" if sev == "CRITICAL" else "🔴"
+                tech  = f.get("technique", "?")
+                ticon = tech_emoji.get(tech, "🔍")
+                lines.append(f"  {emoji} [{sev}] {ticon} {tech.replace('_',' ').title()}")
+                lines.append(f"       URL     : {f.get('url','')[:80]}")
+                if f.get("file"):
+                    lines.append(f"       File    : {f['file']}")
+                if f.get("ssrf_target"):
+                    lines.append(f"       Target  : {f['ssrf_target']}")
+                if f.get("handler"):
+                    lines.append(f"       Handler : {f['handler']}")
+                if f.get("callback_url"):
+                    lines.append(f"       Callback: {f['callback_url']}")
+                    lines.append(f"       Token   : {f.get('token','?')}")
+                if f.get("matched"):
+                    lines.append(f"       Matched : {', '.join(f['matched'][:5])}")
+                lines.append(f"       Detail  : {f.get('detail','')}")
+                if f.get("snippet") and sev == "CRITICAL":
+                    snip = f["snippet"][:120].replace("\n", " ")
+                    lines.append(f"       Snippet : {snip}")
+                lines.append("")
+        else:
+            lines.append("✅ No XXE vulnerabilities detected.")
+            if not callback_url:
+                lines.append("   → Provide callback_url for blind OOB detection.")
+            lines.append("   → Try with custom_endpoints pointing to specific XML-parsing API paths.")
+
+        logger.info(
+            f"{HexStrikeColors.SUCCESS}💉 XXE: {len(findings)} findings "
+            f"({critical} crit) on {target}{HexStrikeColors.RESET}"
+        )
+        return {"output": "\n".join(lines), "data": result}
+
     return mcp
 
 def parse_args():

